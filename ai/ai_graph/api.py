@@ -1,0 +1,2843 @@
+from __future__ import annotations
+
+# pyright: reportUnannotatedClassAttribute=false, reportUnusedFunction=false
+import asyncio
+import hashlib
+import json
+import logging
+import secrets
+import uuid
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from os import environ
+from threading import Lock
+from time import perf_counter
+from typing import ClassVar, Literal
+
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from starlette.concurrency import run_in_threadpool
+
+from ai_graph.audit import (
+    AuditSession,
+    AuditSink,
+    NoOpAuditSink,
+    audit_failure_count,
+    bind_audit_context,
+    create_audit_correlation,
+    report_audit_failure,
+)
+from ai_graph.audit_postgres import audit_sink_runtime_status, resolve_audit_sink
+from ai_graph.auth import RequireAuthenticatedUser, SessionResolver
+from ai_graph.data_sources.db import (
+    ANALYST_REPORT_TABLE,
+    BOK_MACRO_VIEW,
+    KIS_ADJUSTED_OHLCV_TABLE,
+    SYMBOL_MASTER_TABLE,
+    available_indicator_metrics_from_env,
+    is_release_profile,
+    measure_research_runtime_facts_from_env,
+    resolve_database_dsn_from_env,
+)
+from ai_graph.execution_boundary import retired_public_create_detail
+from ai_graph.exploration_policy import (
+    ActiveExplorationPolicyV2,
+    ExplorationPolicyUnavailableError,
+    load_active_exploration_policy_from_env,
+    validate_exploration_spec_against_policy,
+)
+from ai_graph.graph import (
+    build_clarification_prompt,
+    classify_query,
+    run_analysis,
+)
+from ai_graph.job_events import JobEventBuffer
+from ai_graph.job_repository_postgres import PostgresAnalysisJobRepository
+from ai_graph.job_store_persistent import (
+    ImmutableResultEvidenceRepository,
+    PersistentAnalysisJobStore,
+)
+from ai_graph.jobs import (
+    AI_JOB_STORE_ENV,
+    PERSISTENT_JOB_STORE_MODE,
+    AnalysisJob,
+    AnalysisJobOutboxStore,
+    AnalysisJobStatus,
+    AnalysisJobStore,
+    AnalysisRunner,
+    CancellationRegistry,
+    JobStoreConfigurationError,
+    JobStoreRuntime,
+    ParseBoundAdmissionError,
+    ParseBoundJobAdmissionStore,
+    ResearchAppendixStore,
+    create_analysis_job_store_from_env,
+    reap_interrupted_jobs,
+    run_job_sync,
+)
+from ai_graph.llm.role_calls import generate_strategy_description, research_screening_terms
+from ai_graph.nodes.backtest import backtest_cache_ready
+from ai_graph.quant_performance import sanitize_public_performance
+from ai_graph.quant_strategy import classify_strategy_request
+from ai_graph.research_contract import (
+    EXPLORATION_EXECUTION_SPEC_VERSION,
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
+    STRATEGY_EXECUTION_SPEC_VERSION,
+    CanonicalRuleV1,
+    DraftConflictV1,
+    DraftTokenValidationError,
+    ExecutionSpecV1OrV2,
+    ExplorationExecutionSpecV2,
+    InMemoryDraftNonceRegistry,
+    ResearchJobAcceptedV1,
+    ResearchResultV1,
+    RuleDraftSigner,
+    RuleDraftV1,
+    build_rule_draft,
+    canonical_rule_digest,
+    canonical_rule_execution_query,
+    unavailable_result_for_unverified_job,
+)
+from ai_graph.research_eligibility import (
+    EligiblePostgresEod,
+    ResearchRuntimeFacts,
+    evaluate_research_eligibility,
+)
+from ai_graph.schemas import (
+    SCHEMA_VERSION,
+    APIEnvelope,
+    ClarificationOption,
+    EnvelopeStatus,
+    FailureDiagnostic,
+    ReportBundle,
+    ResearchCandidateExecutionSpecV3,
+    Stage,
+    UserPayload,
+)
+from ai_graph.single_process import enforce_single_process
+from ai_graph.token_auth import (
+    AccountTokenQuota,
+    AccountTokenResolver,
+    RequireAuthenticatedIdentityReadOnly,
+    RequireUserIdentity,
+    RequireUserIdentityWithinQuota,
+)
+
+_logger = logging.getLogger(__name__)
+
+API_TITLE = "QuantAgent AI API"
+API_VERSION = "0.1.0"
+API_DESCRIPTION = "Local MVP API surface for QuantAgent analysis jobs."
+DOCS_URL = "/docs"
+OPENAPI_URL = "/openapi.json"
+HEALTH_PATH = "/health"
+READINESS_PATH = "/readiness"
+API_STATUS_PATH = "/api-status"
+ANALYSIS_JOBS_PATH = "/analysis-jobs"
+ANALYSIS_JOB_DETAIL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}"
+ANALYSIS_JOB_EVENTS_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/events"
+ANALYSIS_JOB_CANCEL_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/cancel"
+ANALYSIS_JOB_RESEARCH_APPENDIX_PATH = f"{ANALYSIS_JOBS_PATH}/{{job_id}}/research-appendix"
+# How long an idle SSE reader waits before checking for new provider activity.
+ANALYSIS_EVENT_POLL_SECONDS = 0.25
+# Idle gap after which a comment line is sent so intermediaries keep the stream open.
+ANALYSIS_EVENT_KEEPALIVE_SECONDS = 15.0
+SPEC_STRATEGY_PARSE_PATH = "/api/strategies/parse"
+RESEARCH_JOB_CREATE_PATH = "/api/research/jobs"
+RESEARCH_JOB_RESULT_PATH = f"{RESEARCH_JOB_CREATE_PATH}/{{job_id}}/result"
+STRATEGY_DESCRIPTIONS_PATH = "/api/strategies/descriptions"
+SPEC_ANALYSIS_JOB_DETAIL_PATH = "/api/analysis-jobs/{job_id}"
+SPEC_BACKTEST_DETAIL_PATH = "/api/backtests/{strategy_id}"
+SPEC_REPORT_DETAIL_PATH = "/api/reports/{report_id}"
+DAILY_DIGEST_PATH = "/ai/daily-digest"
+AI_CORS_ALLOW_ORIGINS_ENV = "AI_CORS_ALLOW_ORIGINS"
+CORS_ALLOW_METHODS = ["GET", "POST", "OPTIONS"]
+CORS_ALLOW_HEADERS = ["Authorization", "Content-Type"]
+RESEARCH_EXECUTION_ENABLED_ENV = "AI_RESEARCH_EXECUTION_ENABLED"
+DATA_EVIDENCE_PROBE_TOKEN_ENV = "AI_DATA_EVIDENCE_PROBE_TOKEN"
+DATA_EVIDENCE_PROBE_PATH = "/_operator/research-data-evidence"
+ANALYSIS_JOB_EVIDENCE_PROBE_PATH = "/_operator/analysis-job-evidence/{job_id}"
+DEPLOYMENT_REVISION_ENV = "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+READINESS_CONTRACT_VERSION = "ai-release-readiness.v1"
+REQUIRED_AI_CONTRACT_VERSION = "ai-mvp.v1"
+ANALYSIS_JOBS_MIGRATION_REVISION = "025_exploration_policy_v2"
+AI_LLM_PROVIDER_ENV = "AI_LLM_PROVIDER"
+AI_AOAI_RESPONSES_URL_ENV = "AI_AOAI_RESPONSES_URL"
+AI_AOAI_API_KEY_ENV = "AI_AOAI_API_KEY"
+AI_AOAI_MODEL_ENV = "AI_AOAI_MODEL"
+
+
+class CreateAnalysisJobRequest(BaseModel):
+    """Admission request for the primary strategy workflow.
+
+    A browser may submit one natural-language ``query``. In the production route the
+    server accepts it as a durable job, resolves and seals the execution contract in
+    that job, then hands the sealed spec to the backtest. A parse-bound caller may
+    retain the original query as non-authoritative research/report context; the signed
+    execution spec is always the sole source of backtest conditions.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "parse_token": "opaque parse token from /api/strategies/parse",
+                    "client_idempotency_key": "7f4253d4-e89f-42c4-9c59-2bc35672de67",
+                    "spec_version": STRATEGY_EXECUTION_SPEC_VERSION,
+                    "spec_hash": "a" * 64,
+                    "strategy_execution_spec": {
+                        "market": "KRX",
+                        "timeframe": "daily",
+                        "entry_conditions": [
+                            {
+                                "metric": "rsi",
+                                "comparator": "lte",
+                                "value": 30,
+                                "lookback": 14,
+                                "role": "entry",
+                            }
+                        ],
+                        "exit_conditions": [
+                            {
+                                "metric": "rsi",
+                                "comparator": "gte",
+                                "value": 70,
+                                "lookback": 14,
+                                "role": "exit",
+                            }
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+
+    query: str | None = Field(default=None, min_length=1, max_length=2000)
+    parse_token: str | None = Field(default=None, min_length=32)
+    client_idempotency_key: str | None = Field(default=None, min_length=16, max_length=200)
+    spec_version: (
+        Literal[
+            STRATEGY_EXECUTION_SPEC_VERSION,
+            EXPLORATION_EXECUTION_SPEC_VERSION,
+            RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION,
+        ]
+        | None
+    ) = None
+    spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    strategy_execution_spec: ExecutionSpecV1OrV2 | None = None
+
+    @field_validator("query")
+    @classmethod
+    def require_query_text(cls, value: str | None) -> str | None:
+        """Whitespace is not a strategy request.
+
+        Rejecting it here keeps a blank submission from spending a quota slot and
+        creating a durable job that can only end in a clarification.
+        """
+
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            raise ValueError("query must not be blank")
+        return text
+
+    @model_validator(mode="after")
+    def require_one_admission_shape(self) -> CreateAnalysisJobRequest:
+        parsed_values = (
+            self.parse_token,
+            self.client_idempotency_key,
+            self.spec_version,
+            self.spec_hash,
+            self.strategy_execution_spec,
+        )
+        has_parsed_contract = all(value is not None for value in parsed_values)
+        has_partial_contract = any(value is not None for value in parsed_values)
+        if has_parsed_contract:
+            expected_version = (
+                EXPLORATION_EXECUTION_SPEC_VERSION
+                if isinstance(self.strategy_execution_spec, ExplorationExecutionSpecV2)
+                else RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION
+                if isinstance(self.strategy_execution_spec, ResearchCandidateExecutionSpecV3)
+                else STRATEGY_EXECUTION_SPEC_VERSION
+            )
+            if self.spec_version != expected_version:
+                raise ValueError("spec_version must match strategy_execution_spec")
+            return self
+        if self.query is not None and not has_partial_contract:
+            return self
+        raise ValueError("provide either query or a complete parse-bound execution contract")
+
+    @property
+    def is_parse_bound(self) -> bool:
+        return self.strategy_execution_spec is not None
+
+
+class CoreJobIdempotencyConflictV1(BaseModel):
+    """Safe response for a client key reused with a different execution spec."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: Literal["idempotency_conflict"] = "idempotency_conflict"
+    reason_code: Literal["idempotency_key_reused", "idempotency_in_progress"]
+    explanation: str = Field(min_length=1)
+
+
+class LegacyParseRequiredV1(BaseModel):
+    """Safe migration response for a raw-query client that needs to call parse first."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    kind: Literal["parse_required"] = "parse_required"
+    explanation: str = Field(min_length=1)
+    outcome: RuleDraftV1
+
+
+class _CoreJobIdempotencyRegistry:
+    """Process-local retry fence for the current single-process job runtime.
+
+    The durable cross-process version is intentionally not faked here: it belongs in
+    the PostgreSQL parse-token/job/outbox transaction.  This fence still prevents the
+    common browser retry from creating a second paid job in this process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._requests: dict[tuple[str, str], tuple[str, str | None]] = {}
+
+    def begin(self, *, user_id: str, key: str, spec_hash: str) -> tuple[str, str | None]:
+        request_key = (user_id, key)
+        with self._lock:
+            existing = self._requests.get(request_key)
+            if existing is None:
+                self._requests[request_key] = (spec_hash, None)
+                return "new", None
+            existing_hash, job_id = existing
+            if existing_hash != spec_hash:
+                return "conflict", None
+            return ("existing", job_id) if job_id is not None else ("pending", None)
+
+    def complete(self, *, user_id: str, key: str, spec_hash: str, job_id: str) -> None:
+        with self._lock:
+            if self._requests.get((user_id, key)) == (spec_hash, None):
+                self._requests[(user_id, key)] = (spec_hash, job_id)
+
+    def discard(self, *, user_id: str, key: str, spec_hash: str) -> None:
+        with self._lock:
+            if self._requests.get((user_id, key)) == (spec_hash, None):
+                del self._requests[(user_id, key)]
+
+
+class ConfirmedResearchExecutionRequest(BaseModel):
+    """A signed canonical rule; raw natural-language input is never accepted here."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    canonical_rule: CanonicalRuleV1
+    draft_token: str = Field(min_length=32)
+
+
+class ParseStrategyRequest(BaseModel):
+    # Ignore retired request keys from older frontends during the rolling deploy.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
+
+    natural_language: str | None = Field(default=None, min_length=1, max_length=2000)
+    query: str | None = Field(default=None, min_length=1, max_length=2000)
+    market: str | None = None
+    strategy_id: str | None = None
+    selected_clarification_option_id: str | None = None
+    client_request_id: str | None = None
+
+    @model_validator(mode="after")
+    def require_query_text(self) -> ParseStrategyRequest:
+        natural_language = (self.natural_language or "").strip()
+        query = (self.query or "").strip()
+        # During a rolling FE/AI deploy the browser sends both aliases.  Treat a
+        # disagreement as a request-contract error instead of silently choosing
+        # one wording and researching a different strategy from the one the user
+        # submitted.
+        if natural_language and query and natural_language != query:
+            raise ValueError("natural_language and query must match when both are provided")
+        if not (natural_language or query):
+            raise ValueError("natural_language or query is required")
+        return self
+
+    @property
+    def request_text(self) -> str:
+        return (self.natural_language or self.query or "").strip()
+
+
+class DataEvidenceProbeResponse(BaseModel):
+    """Non-public, secret-free read-only measurement response for release evidence."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    decision: Literal["eligible", "ineligible"]
+    reason_code: str | None = None
+    facts: ResearchRuntimeFacts
+    deployment_revision: str | None = None
+
+
+class AnalysisJobEvidenceProbeResponse(BaseModel):
+    """Secret-free immutable result proof used only by the isolated staging gate."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    job_id: str
+    # The evidence endpoint is also used for V3 research-resolved strategies.  It
+    # verifies the immutable result link, not just the legacy deterministic RSI
+    # parser, so rejecting a V3 spec here would hide an otherwise valid live run.
+    execution_spec_version: Literal[
+        "strategy-execution-spec.v1",
+        "exploration-execution-spec.v2",
+        "research-candidate-execution-spec.v3",
+    ]
+    execution_spec_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    analysis_result_id: str
+    manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: Literal["postgres"]
+    as_of: str = Field(min_length=1)
+    observations: int = Field(gt=0)
+    candidate_count: int = Field(ge=0)
+    successful_aoai_calls: int = Field(ge=0)
+    immutable_trigger_present: bool
+
+
+def _draft_conflict_response(code: str) -> JSONResponse:
+    allowed_codes = {
+        "draft_invalid",
+        "draft_expired",
+        "draft_user_mismatch",
+        "draft_rule_mismatch",
+        "draft_replayed",
+    }
+    reason_code = code if code in allowed_codes else "draft_invalid"
+    response = DraftConflictV1(
+        reason_code=reason_code,
+        explanation="검토한 규칙 초안이 변경되었거나 더 이상 유효하지 않습니다.",
+        guidance="규칙을 다시 검토한 뒤 새 초안으로 실행해 주세요.",
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(),
+    )
+
+
+def _parse_nonce_hash(nonce: str) -> str:
+    """Persist a one-way nonce identifier; never persist the signed parse token itself."""
+
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+
+
+def _idempotency_conflict_response(
+    code: Literal["idempotency_key_reused", "idempotency_in_progress"],
+) -> JSONResponse:
+    response = CoreJobIdempotencyConflictV1(
+        reason_code=code,
+        explanation=(
+            "같은 요청 키가 다른 전략 명세에 사용되었습니다. 새 요청 키로 다시 시도해 주세요."
+            if code == "idempotency_key_reused"
+            else "동일한 전략 요청이 처리 중입니다. 잠시 후 상태를 다시 확인해 주세요."
+        ),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(),
+    )
+
+
+def _legacy_parse_required_response(outcome: RuleDraftV1) -> JSONResponse:
+    response = LegacyParseRequiredV1(
+        explanation="전략 해석 결과를 확인한 뒤 실행해 주세요.",
+        outcome=outcome,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json"),
+    )
+
+
+class StrategyDescriptionInput(BaseModel):
+    # Ignore retired keys from older frontends during the rolling deploy.
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
+
+    strategy_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+    entry_summary: str = Field(min_length=1)
+    exit_summary: str = Field(min_length=1)
+    risk_summary: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list, max_length=8)
+
+
+class StrategyDescriptionsRequest(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    strategies: list[StrategyDescriptionInput] = Field(min_length=1, max_length=20)
+
+
+class StrategyDescriptionItem(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    strategy_id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    fallback_reasons: list[str] = Field(default_factory=list)
+
+
+class StrategyDescriptionsResponse(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    items: list[StrategyDescriptionItem] = Field(min_length=1)
+
+
+class HealthResponse(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    status: Literal["ok"]
+    schema_version: str
+
+
+class ReadinessCheck(BaseModel):
+    """One non-secret release dependency result."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    name: Literal[
+        "durable_job_store",
+        "migration_revision",
+        "live_provider_configuration",
+        "ai_contract_version",
+        "rule_draft_signer",
+        "backtest_evaluation_cache",
+    ]
+    ready: bool
+    reason: str | None = None
+
+
+class ReadinessResponse(BaseModel):
+    """Fail-closed admission status for a deployable AI release."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    status: Literal["ready", "unavailable"]
+    contract_version: str = READINESS_CONTRACT_VERSION
+    migration_revision: str = ANALYSIS_JOBS_MIGRATION_REVISION
+    ai_contract_version: str
+    checks: list[ReadinessCheck]
+
+
+class EndpointStatus(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    method: Literal["GET", "POST"]
+    path: str
+    state: Literal["available", "local_sync", "job_async", "job_store", "readiness", "retired"]
+    summary: str
+
+
+class DataSourceStatus(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    configured: bool
+    dsn_env: str
+    price_source: str
+    candidate_pool_source: str
+    l4_evidence_source: str
+    macro_source: str
+    macro_usable: bool
+    fallback_when_unset: str
+
+
+class JobStoreStatus(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    requested_mode: str
+    active_mode: str
+    mode_env: str
+    dsn_env: str
+    dsn_configured: bool
+    fallback: bool
+    fallback_reason: str | None
+
+
+class AuditStatus(BaseModel):
+    """Secret-free evidence that analysis traces can be persisted."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    sink: Literal["postgres", "noop"]
+    admission_authorized: bool
+    failure_count: int = Field(ge=0)
+
+
+class APIStatusResponse(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    service: str
+    schema_version: str
+    docs_url: str
+    openapi_url: str
+    data_source: DataSourceStatus
+    job_store: JobStoreStatus
+    audit: AuditStatus
+    endpoints: list[EndpointStatus]
+    deployment_revision: str | None = None
+
+
+def _clarification_envelope(outcome: RuleDraftV1, *, query: str, trace_id: str) -> APIEnvelope:
+    """The NEED_CLARIFICATION contract for a parse that cannot run as asked.
+
+    Reuses the graph's clarification builder so the browser sees one shape: a
+    question, up to three options, and three candidate cards.
+
+    The question follows why the draft stopped, not a fixed category: a greeting was
+    being answered with "먼저 어떤 후보 전략으로 구체화할까요?" and three unrelated
+    strategy options, which is not a question about anything the user said.
+    """
+
+    options = [
+        ClarificationOption(label=choice.label, reason=choice.reason)
+        for choice in outcome.clarifications
+    ]
+    if outcome.retry_only:
+        # The research provider did not answer.  Nothing about the request was found
+        # unsupported, so a question about which strategy to pick - and three generic
+        # options for rewriting it - would be an answer to something the user never
+        # asked.  One action applies: run the same input again.
+        return APIEnvelope(
+            status=EnvelopeStatus.NEED_CLARIFICATION,
+            trace_id=trace_id,
+            user_payload=UserPayload(
+                headline="일시적인 오류로 분석을 시작하지 못했습니다.",
+                message=outcome.explanation,
+                next_actions=["잠시 후 같은 입력으로 다시 시도"],
+                question="잠시 후 같은 입력으로 다시 시도할까요?",
+                options=options[:1],
+                recommended=0,
+            ),
+            debug_ref=f"clarification:{trace_id}",
+            retryable=True,
+        )
+    prompt = build_clarification_prompt(classify_query(query), query)
+    chosen = {option.label for option in options}
+    options.extend(option for option in prompt["options"] if option.label not in chosen)
+    next_actions = [f"{item.condition}: {item.reason}" for item in outcome.unsupported_conditions]
+    return APIEnvelope(
+        status=EnvelopeStatus.NEED_CLARIFICATION,
+        trace_id=trace_id,
+        user_payload=UserPayload(
+            headline="추가 확인이 필요합니다.",
+            message=outcome.explanation,
+            next_actions=next_actions or ["시장/기간/조건 보강", "원래 규칙 유지"],
+            # A clarification before analyst research has no evidence-backed cards to
+            # display. Do not turn the user's text into a generic technical template.
+            candidate_cards=[],
+            question=prompt["question"],
+            options=options[:3],
+            recommended=prompt["recommended"],
+        ),
+        debug_ref=f"clarification:{trace_id}",
+        retryable=True,
+    )
+
+
+def _build_analysis_runner_with_audit(
+    analysis_runner: AnalysisRunner,
+    *,
+    audit_sink: AuditSink | None,
+    trace_id: str,
+    entrypoint: str,
+    feature: str,
+    strategy_id: str | None = None,
+    client_request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    execution_spec: object | None = None,
+    execution_spec_hash: str | None = None,
+    rule_draft_resolver: Callable[[str, str], RuleDraftV1] | None = None,
+) -> AnalysisRunner:
+    def runner(query: str, trace_id: str) -> APIEnvelope:
+        session = _open_request_audit_session(
+            audit_sink,
+            trace_id=trace_id,
+            entrypoint=entrypoint,
+            feature=feature,
+            strategy_id=strategy_id,
+            client_request_id=client_request_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        _record_step(session, "job_dispatched", message="analysis request dispatched")
+        resolved_execution_spec = execution_spec
+        resolved_execution_spec_hash = execution_spec_hash
+        if rule_draft_resolver is not None:
+            # Natural-language V3 resolution is part of the job, not the HTTP
+            # admission request. Web-grounded AOAI research therefore cannot exhaust
+            # a reverse proxy's request timeout before the browser receives its job
+            # id. The sealed result still becomes the sole graph authority.
+            _record_step(
+                session,
+                "strategy_research_resolution_started",
+                message="strategy research started inside analysis job",
+            )
+            outcome = rule_draft_resolver(query, trace_id)
+            if (
+                not outcome.is_executable
+                or outcome.strategy_execution_spec is None
+                or outcome.spec_hash is None
+            ):
+                # A parse that needs the user to decide something is not a failure.
+                # Failing the job here showed a red error for a question the browser
+                # already knows how to render, so return the same NEED_CLARIFICATION
+                # contract the graph produces for an unusable query instead.
+                # StrategyResearchError still propagates for provider/schema faults.
+                _record_step(
+                    session,
+                    "strategy_research_clarification_required",
+                    message="strategy research needs user clarification",
+                )
+                envelope = _clarification_envelope(outcome, query=query, trace_id=trace_id)
+                _record_finalization(
+                    session,
+                    "completed",
+                    message="analysis runner completed with status=need_clarification",
+                    metadata_jsonb={
+                        "debug_ref": envelope.debug_ref,
+                        "public_trace_id": envelope.trace_id,
+                    },
+                )
+                return envelope
+            resolved_execution_spec = outcome.strategy_execution_spec
+            resolved_execution_spec_hash = outcome.spec_hash
+            _record_step(
+                session,
+                "strategy_research_resolution_completed",
+                message="sealed strategy research contract attached to analysis",
+            )
+        # ``ai_graph.research_contract`` and ``ai_graph.schemas`` each declare their
+        # own V1/V2 execution-spec classes for the same JSON shape, so an instance
+        # sealed by one module is a foreign class to the other's validator and
+        # pydantic rejects it outright.  Hand the graph the JSON form so the two
+        # class families never meet.  (Unifying them is a larger refactor.)
+        if isinstance(resolved_execution_spec, BaseModel):
+            resolved_execution_spec = resolved_execution_spec.model_dump(mode="json")
+        with bind_audit_context(session):
+            if analysis_runner is run_analysis:
+                return run_analysis(
+                    query,
+                    trace_id,
+                    audit_session=session,
+                    audit_entrypoint=entrypoint,
+                    audit_feature=feature,
+                    strategy_id=strategy_id,
+                    client_request_id=client_request_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    execution_spec=resolved_execution_spec,
+                    execution_spec_hash=resolved_execution_spec_hash,
+                )
+            _record_step(session, "analysis_started", message="analysis runner execution started")
+            try:
+                envelope = analysis_runner(query, trace_id)
+            except Exception as exc:
+                _record_error(
+                    session,
+                    "analysis_execution",
+                    error_type=type(exc).__name__,
+                    message=f"{type(exc).__name__} raised during analysis runner execution",
+                )
+                _record_finalization(session, "failed", message="analysis runner execution failed")
+                raise
+            status_label = envelope.status.value
+            _record_step(
+                session,
+                "analysis_completed",
+                message=f"analysis runner returned status={status_label}",
+            )
+            _record_finalization(
+                session,
+                "failed" if envelope.status == EnvelopeStatus.FAILED else "completed",
+                message=f"analysis runner completed with status={status_label}",
+                metadata_jsonb={
+                    "debug_ref": envelope.debug_ref,
+                    "public_trace_id": envelope.trace_id,
+                },
+            )
+            return envelope
+
+    return runner
+
+
+async def _dispatch_analysis_job_outbox(
+    store: AnalysisJobStore,
+    *,
+    analysis_runner: AnalysisRunner,
+    audit_sink: AuditSink | None,
+    events: JobEventBuffer,
+    cancellations: CancellationRegistry,
+    max_messages: int = 32,
+) -> None:
+    """Execute only atomically admitted jobs, then settle their dispatch record.
+
+    A process may die after a row is claimed and before the runner starts. Such a
+    claim is lease-recoverable; startup runs this dispatcher after it reconciles old
+    RUNNING jobs. The database selects only QUEUED rows, so a terminal job can never
+    be silently run a second time merely because an outbox acknowledgement was lost.
+    """
+
+    if not isinstance(store, AnalysisJobOutboxStore):
+        return
+    for _ in range(max_messages):
+        try:
+            messages = await run_in_threadpool(store.claim_analysis_job_outbox, limit=1)
+        except JobStoreConfigurationError:
+            _logger.warning("analysis-job outbox is not configured; dispatch is unavailable")
+            return
+        if not messages:
+            return
+        message = messages[0]
+        job = await run_in_threadpool(store.get_job, message.job_id)
+        if job is None:
+            _logger.error(
+                "claimed analysis-job outbox record has no job: outbox_id=%s", message.outbox_id
+            )
+            await run_in_threadpool(store.release_analysis_job_outbox, message.outbox_id)
+            return
+        try:
+            await run_in_threadpool(
+                run_job_sync,
+                store,
+                job.job_id,
+                _build_analysis_runner_with_audit(
+                    analysis_runner,
+                    audit_sink=audit_sink,
+                    trace_id=job.trace_id,
+                    entrypoint="api.analysis_job_outbox",
+                    feature="analysis_job",
+                    user_id=job.user_id,
+                    execution_spec=job.execution_spec,
+                    execution_spec_hash=job.execution_spec_hash,
+                ),
+                events=events,
+                cancellations=cancellations,
+            )
+        except Exception:
+            _logger.exception(
+                "analysis-job outbox runner escaped before terminal state: outbox_id=%s job_id=%s",
+                message.outbox_id,
+                message.job_id,
+            )
+            # A runner escaping this outer boundary is not a provider retry.  Leaving
+            # the row pending would require a later request or restart to make progress
+            # and can otherwise leave the user on an infinite queued spinner.  Convert
+            # it to the same safe terminal failure contract as `run_job_sync` does for
+            # ordinary runner exceptions, then acknowledge the outbox record.
+            try:
+                escaped_job = await run_in_threadpool(store.get_job, message.job_id)
+                if escaped_job is None:
+                    raise KeyError(message.job_id)
+                if escaped_job.status not in {
+                    AnalysisJobStatus.COMPLETED,
+                    AnalysisJobStatus.FAILED,
+                }:
+                    await run_in_threadpool(
+                        store.fail_job,
+                        message.job_id,
+                        "분석 실행 중 내부 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                    )
+                await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
+            except Exception:
+                _logger.exception(
+                    "could not settle escaped analysis-job outbox runner: outbox_id=%s job_id=%s",
+                    message.outbox_id,
+                    message.job_id,
+                )
+                await run_in_threadpool(store.release_analysis_job_outbox, message.outbox_id)
+            return
+
+        terminal_job = await run_in_threadpool(store.get_job, message.job_id)
+        if terminal_job is None or terminal_job.status not in {
+            AnalysisJobStatus.COMPLETED,
+            AnalysisJobStatus.FAILED,
+        }:
+            _logger.error(
+                "analysis-job outbox runner returned without a terminal job: outbox_id=%s job_id=%s",
+                message.outbox_id,
+                message.job_id,
+            )
+            try:
+                if terminal_job is None:
+                    raise KeyError(message.job_id)
+                await run_in_threadpool(
+                    store.fail_job,
+                    message.job_id,
+                    "분석 실행이 완료 상태를 반환하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                )
+                await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
+            except Exception:
+                _logger.exception(
+                    "could not settle non-terminal analysis-job outbox runner: outbox_id=%s job_id=%s",
+                    message.outbox_id,
+                    message.job_id,
+                )
+                await run_in_threadpool(store.release_analysis_job_outbox, message.outbox_id)
+            return
+        await run_in_threadpool(store.mark_analysis_job_outbox_delivered, message.outbox_id)
+
+
+def _default_research_appendix_runner(job: AnalysisJob) -> Mapping[str, object] | None:
+    return research_screening_terms(query=job.query)
+
+
+async def _dispatch_research_appendix_outbox(
+    store: AnalysisJobStore,
+    *,
+    research_runner: Callable[[AnalysisJob], Mapping[str, object] | None],
+    max_messages: int = 32,
+) -> None:
+    if not isinstance(store, ResearchAppendixStore):
+        return
+    for _ in range(max_messages):
+        messages = await run_in_threadpool(store.claim_research_appendix_outbox, limit=1)
+        if not messages:
+            return
+        message = messages[0]
+        job = await run_in_threadpool(store.get_job, message.job_id)
+        if job is None:
+            await run_in_threadpool(
+                store.mark_research_appendix_unavailable,
+                message.outbox_id,
+                message.job_id,
+                "analysis_job_missing",
+            )
+            continue
+        if job.status is not AnalysisJobStatus.COMPLETED:
+            await run_in_threadpool(
+                store.mark_research_appendix_unavailable,
+                message.outbox_id,
+                job.job_id,
+                "base_report_unavailable",
+            )
+            continue
+        try:
+            payload = await run_in_threadpool(research_runner, job)
+        except Exception:
+            _logger.exception("asynchronous research appendix failed: job_id=%s", job.job_id)
+            payload = None
+        if payload is None:
+            await run_in_threadpool(
+                store.mark_research_appendix_unavailable,
+                message.outbox_id,
+                job.job_id,
+                "live_research_unavailable",
+            )
+        else:
+            await run_in_threadpool(
+                store.complete_research_appendix,
+                message.outbox_id,
+                job.job_id,
+                payload,
+            )
+
+
+async def _dispatch_analysis_and_research_outboxes(
+    store: AnalysisJobStore,
+    *,
+    analysis_runner: AnalysisRunner,
+    research_runner: Callable[[AnalysisJob], Mapping[str, object] | None],
+    audit_sink: AuditSink | None,
+    events: JobEventBuffer,
+    cancellations: CancellationRegistry,
+) -> None:
+    await _dispatch_analysis_job_outbox(
+        store,
+        analysis_runner=analysis_runner,
+        audit_sink=audit_sink,
+        events=events,
+        cancellations=cancellations,
+    )
+    await _dispatch_research_appendix_outbox(
+        store,
+        research_runner=research_runner,
+    )
+
+
+def _open_request_audit_session(
+    audit_sink: AuditSink | None,
+    *,
+    trace_id: str | None,
+    entrypoint: str,
+    feature: str,
+    strategy_id: str | None = None,
+    client_request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> AuditSession:
+    correlation = create_audit_correlation(
+        trace_id=trace_id,
+        debug_ref=None,
+        entrypoint=entrypoint,
+        feature=feature,
+        strategy_id=strategy_id,
+        client_request_id=client_request_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    sink = resolve_audit_sink(audit_sink)
+    try:
+        return sink.open_session(correlation)
+    except Exception:
+        report_audit_failure("open_session")
+        return NoOpAuditSink().open_session(correlation)
+
+
+def _record_step(session: AuditSession, step: str, *, message: str | None = None) -> None:
+    try:
+        session.record_step(step, message=message)
+    except Exception:
+        report_audit_failure("record_step")
+
+
+def _record_error(
+    session: AuditSession,
+    step: str,
+    *,
+    error_type: str,
+    message: str,
+) -> None:
+    try:
+        session.record_error(step, error_type=error_type, message=message)
+    except Exception:
+        report_audit_failure("record_error")
+
+
+def _record_finalization(
+    session: AuditSession,
+    status: str,
+    *,
+    message: str | None = None,
+    metadata_jsonb: dict[str, object] | None = None,
+) -> None:
+    try:
+        session.record_finalization(status, message=message, metadata_jsonb=metadata_jsonb)
+    except Exception:
+        report_audit_failure("record_finalization")
+
+
+def _rule_draft_audit_metadata(outcome: RuleDraftV1) -> dict[str, object]:
+    """Return the parse result identifiers needed to join audit rows to a job.
+
+    The AOAI client records the complete prompt and response in the model/prompt
+    audit tables while it is bound to this session.  This smaller agent-execution
+    record is deliberately an index: it lets an operator locate the exact model
+    calls and the sealed execution contract without duplicating the raw prompt in
+    every audit table.
+    """
+
+    return {
+        "kind": outcome.kind,
+        "is_executable": outcome.is_executable,
+        "authoring_method": outcome.authoring_method,
+        "spec_version": outcome.spec_version,
+        "spec_hash": outcome.spec_hash,
+        "clarification_required": outcome.clarification_required,
+    }
+
+
+def _build_rule_draft_with_audit(
+    *,
+    audit_sink: AuditSink | None,
+    trace_id: str,
+    entrypoint: str,
+    feature: str,
+    client_request_id: str | None,
+    query: str,
+    user_id: str,
+    signer: RuleDraftSigner,
+    available_metrics: list[str] | tuple[str, ...] | None,
+    use_llm: bool,
+    exploration_policy: ActiveExplorationPolicyV2 | None,
+    propagate_provider_failure: bool = False,
+) -> RuleDraftV1:
+    """Build a V3 draft inside a durable audit context.
+
+    V3 research happens before a job exists, which used to leave AOAI calls with no
+    active audit session.  Keeping this boundary separate from job execution makes
+    the parse-stage prompt/response, provider failure, repaired response, and sealed
+    spec hash observable in ``AI_DATABASE_DSN`` without treating a parse as a job.
+    """
+
+    session = _open_request_audit_session(
+        audit_sink,
+        trace_id=trace_id,
+        entrypoint=entrypoint,
+        feature=feature,
+        client_request_id=client_request_id,
+        user_id=user_id,
+    )
+    _record_step(session, "strategy_research_resolution_started", message="strategy parse started")
+    execution_id = None
+    try:
+        execution_id = session.start_agent_execution(
+            "Strategy Research",
+            step_name="strategy_research_resolution",
+            input_jsonb={
+                "query_digest": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                "use_llm": use_llm,
+                "available_metric_count": len(available_metrics or ()),
+            },
+        )
+    except Exception:  # noqa: BLE001 - audit writes must not block an otherwise valid parse.
+        report_audit_failure("start_agent_execution")
+
+    started = perf_counter()
+    try:
+        with bind_audit_context(session, execution_id):
+            outcome = build_rule_draft(
+                query=query,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                use_llm=use_llm,
+                exploration_policy=exploration_policy,
+                propagate_provider_failure=propagate_provider_failure,
+            )
+    except Exception as exc:
+        latency_ms = (perf_counter() - started) * 1_000
+        if execution_id is not None:
+            try:
+                session.finish_agent_execution(
+                    execution_id,
+                    status="failed",
+                    output_jsonb={},
+                    error_message=f"{type(exc).__name__} during strategy research resolution",
+                    latency_ms=latency_ms,
+                )
+            except Exception:  # noqa: BLE001 - audit writes must not block an otherwise valid parse.
+                report_audit_failure("finish_agent_execution")
+        _record_error(
+            session,
+            "strategy_research_resolution",
+            error_type=type(exc).__name__,
+            message=f"{type(exc).__name__} during strategy research resolution",
+        )
+        _record_finalization(session, "failed", message="strategy parse failed")
+        raise
+
+    latency_ms = (perf_counter() - started) * 1_000
+    metadata = _rule_draft_audit_metadata(outcome)
+    if execution_id is not None:
+        try:
+            session.finish_agent_execution(
+                execution_id,
+                status="succeeded",
+                output_jsonb=metadata,
+                latency_ms=latency_ms,
+            )
+        except Exception:  # noqa: BLE001 - audit writes must not block an otherwise valid parse.
+            report_audit_failure("finish_agent_execution")
+    _record_step(
+        session,
+        "strategy_research_resolution_completed",
+        message=(
+            "sealed V3 execution spec"
+            if outcome.is_executable
+            else "research resolution unavailable"
+        ),
+    )
+    _record_finalization(
+        session,
+        "completed",
+        message="strategy parse completed",
+        metadata_jsonb=metadata,
+    )
+    return outcome
+
+
+class DemoSendReportRequest(BaseModel):
+    """시연용 리포트 이메일 전송 요청."""
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="ignore")
+
+    job_id: str = Field(min_length=1)
+    recipient: str | None = Field(default=None, max_length=254)
+
+
+def create_app(
+    job_store: AnalysisJobStore | None = None,
+    *,
+    analysis_runner: AnalysisRunner = run_analysis,
+    job_store_runtime: JobStoreRuntime | None = None,
+    audit_sink: AuditSink | None = None,
+    session_resolver: SessionResolver | None = None,
+    account_token_resolver: AccountTokenResolver | None = None,
+    account_token_quota: AccountTokenQuota | None = None,
+    rule_draft_signer: RuleDraftSigner | None = None,
+    draft_nonce_registry: InMemoryDraftNonceRegistry | None = None,
+    research_execution_enabled: bool | None = None,
+    readiness_migration_probe: Callable[[], bool] | None = None,
+    indicator_catalog_resolver: Callable[[], Sequence[str] | None] | None = None,
+    exploration_policy_resolver: Callable[[], ActiveExplorationPolicyV2] | None = None,
+    research_appendix_runner: Callable[[AnalysisJob], Mapping[str, object] | None] | None = None,
+    immutable_result_evidence_probe: Callable[[str], Mapping[str, object] | None] | None = None,
+) -> FastAPI:
+    runtime = job_store_runtime or _job_store_runtime(job_store)
+    store = runtime.store
+    # Identity accepts either a bearer API token or the browser session cookie. Routes
+    # that spend AOAI capacity use the quota-enforcing variant instead, so a token's
+    # allowance is charged exactly where the provider cost is incurred - listing or
+    # cancelling a job consumes none, and is not counted against it.
+    require_user = RequireUserIdentity(
+        session_requirement=RequireAuthenticatedUser(session_resolver),
+        token_resolver=account_token_resolver,
+    )
+    require_user_within_quota = RequireUserIdentityWithinQuota(
+        require_user, quota=account_token_quota
+    )
+    require_authenticated_identity = RequireAuthenticatedIdentityReadOnly(
+        session_requirement=RequireAuthenticatedUser(session_resolver),
+        token_resolver=account_token_resolver,
+        quota=account_token_quota,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Reject unsafe worker fan-out and reconcile jobs left running after a restart."""
+
+        enforce_single_process()
+        # A partial sweep leaves jobs that still claim to be executing, so the job API
+        # cannot be served honestly until reconciliation succeeds.  The typed error
+        # from the store crosses the lifespan boundary and makes readiness fail closed.
+        reaped = await run_in_threadpool(reap_interrupted_jobs, store)
+        if reaped:
+            _logger.warning(
+                "failed %d analysis job(s) left running by a previous process: %s",
+                len(reaped),
+                ", ".join(reaped),
+            )
+        # Startup recovery is deliberately driven from the durable outbox, not from
+        # any old in-process background-task list.  A task only claims queued jobs;
+        # a RUNNING job is settled by the restart reaper above before it can be seen.
+        outbox_task: asyncio.Task[None] | None = None
+        if isinstance(store, AnalysisJobOutboxStore):
+            outbox_task = asyncio.create_task(
+                _dispatch_analysis_and_research_outboxes(
+                    store,
+                    analysis_runner=analysis_runner,
+                    research_runner=app.state.research_appendix_runner,
+                    audit_sink=app.state.audit_sink,
+                    events=app.state.job_events,
+                    cancellations=app.state.job_cancellations,
+                )
+            )
+        try:
+            yield
+        finally:
+            if outbox_task is not None and not outbox_task.done():
+                outbox_task.cancel()
+                try:
+                    await outbox_task
+                except asyncio.CancelledError:
+                    pass
+
+    app = FastAPI(
+        title=API_TITLE,
+        version=API_VERSION,
+        description=API_DESCRIPTION,
+        docs_url=DOCS_URL,
+        openapi_url=OPENAPI_URL,
+        lifespan=lifespan,
+    )
+    cors_allow_origins = _cors_allow_origins()
+    if cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_allow_origins,
+            allow_credentials=True,
+            allow_methods=CORS_ALLOW_METHODS,
+            allow_headers=CORS_ALLOW_HEADERS,
+        )
+    app.state.job_store = store
+    app.state.job_store_runtime = runtime
+    app.state.job_events = JobEventBuffer()
+    app.state.job_cancellations = CancellationRegistry()
+    app.state.audit_sink = resolve_audit_sink(audit_sink)
+    app.state.rule_draft_signer = rule_draft_signer or RuleDraftSigner.from_env()
+    app.state.indicator_catalog_resolver = indicator_catalog_resolver or _resolve_indicator_catalog
+    app.state.exploration_policy_resolver = (
+        exploration_policy_resolver or load_active_exploration_policy_from_env
+    )
+    app.state.research_appendix_runner = (
+        research_appendix_runner or _default_research_appendix_runner
+    )
+    app.state.indicator_catalog_uses_server = bool(
+        indicator_catalog_resolver or resolve_database_dsn_from_env()[0]
+    )
+    from ai_graph.llm import is_live_llm_provider
+
+    app.state.strategy_parser_uses_llm = bool(
+        app.state.indicator_catalog_uses_server and is_live_llm_provider()
+    )
+    app.state.draft_nonce_registry = draft_nonce_registry or InMemoryDraftNonceRegistry()
+    app.state.core_job_idempotency_registry = _CoreJobIdempotencyRegistry()
+    app.state.research_execution_enabled = (
+        research_execution_enabled
+        if research_execution_enabled is not None
+        else _research_execution_enabled()
+    )
+    # Natural-language strategy analysis is the product's primary workflow. In a
+    # release profile it is admitted only when durable execution and the configured
+    # provider are ready; an unavailable dependency is a typed failure, not a reason
+    # to delete the feature or substitute a fixture result.
+    app.state.core_analysis_jobs_enabled = True
+    migration_probe = readiness_migration_probe or _analysis_jobs_migration_is_current
+
+    probe_token = (environ.get(DATA_EVIDENCE_PROBE_TOKEN_ENV) or "").strip()
+    if probe_token:
+
+        @app.get(
+            DATA_EVIDENCE_PROBE_PATH,
+            response_model=DataEvidenceProbeResponse,
+            include_in_schema=False,
+        )
+        def research_data_evidence_probe(
+            x_ai_evidence_probe: str | None = Header(default=None),
+        ) -> DataEvidenceProbeResponse:
+            """Execute only the bounded DB adapter and policy; never create a job.
+
+            The route is absent unless a separate operator secret is configured. It
+            deliberately bypasses normal token/session resolvers because those can
+            update usage/cache state; the probe must remain read-only end-to-end.
+            """
+
+            if not x_ai_evidence_probe or not secrets.compare_digest(
+                x_ai_evidence_probe, probe_token
+            ):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            trace_id = f"evidence-{uuid.uuid4()}"
+            facts = measure_research_runtime_facts_from_env(
+                "KRX 상장 종목의 RSI 조건을 검토",
+                trace_id,
+            )
+            decision = evaluate_research_eligibility(facts)
+            return DataEvidenceProbeResponse(
+                decision=decision.kind,
+                reason_code=None
+                if isinstance(decision, EligiblePostgresEod)
+                else decision.reason_code,
+                facts=facts,
+                deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
+            )
+
+    evidence_reader = immutable_result_evidence_probe
+    if evidence_reader is None and isinstance(store, ImmutableResultEvidenceRepository):
+        evidence_reader = store.immutable_result_evidence
+    if evidence_reader is not None:
+
+        @app.get(
+            ANALYSIS_JOB_EVIDENCE_PROBE_PATH,
+            response_model=AnalysisJobEvidenceProbeResponse,
+            include_in_schema=False,
+        )
+        def analysis_job_evidence_probe(
+            job_id: str,
+            x_ai_evidence_probe: str | None = Header(default=None),
+        ) -> AnalysisJobEvidenceProbeResponse:
+            if (
+                not probe_token
+                or not x_ai_evidence_probe
+                or not secrets.compare_digest(x_ai_evidence_probe, probe_token)
+            ):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            try:
+                evidence = evidence_reader(job_id)
+            except Exception:  # noqa: BLE001 - never disclose database details on a probe.
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="immutable result evidence unavailable",
+                ) from None
+            if evidence is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+            if hasattr(evidence, "__dict__"):
+                evidence = vars(evidence)
+            return AnalysisJobEvidenceProbeResponse.model_validate(evidence)
+
+    # async on purpose: a sync handler runs in the same anyio worker pool the analysis
+    # background tasks occupy, so a burst of analyses used to make liveness time out and
+    # the service look dead to whatever was watching it. Neither of these touches the
+    # database or blocks, so neither needs a worker thread.
+    @app.get(HEALTH_PATH, response_model=HealthResponse, tags=["System"])
+    async def health() -> HealthResponse:
+        return HealthResponse(status="ok", schema_version=SCHEMA_VERSION)
+
+    @app.get(
+        READINESS_PATH,
+        response_model=ReadinessResponse,
+        responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ReadinessResponse}},
+        tags=["System"],
+    )
+    async def readiness(response: Response) -> ReadinessResponse:
+        result = _release_readiness(
+            runtime,
+            migration_probe=migration_probe,
+            rule_draft_signer=app.state.rule_draft_signer,
+            provider_ready=_live_provider_configuration_is_ready(),
+        )
+        if result.status == "unavailable":
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return result
+
+    @app.get(API_STATUS_PATH, response_model=APIStatusResponse, tags=["System"])
+    def api_status() -> APIStatusResponse:
+        audit_sink, audit_admission_authorized = audit_sink_runtime_status(app.state.audit_sink)
+        return APIStatusResponse(
+            service=API_TITLE,
+            schema_version=SCHEMA_VERSION,
+            docs_url=DOCS_URL,
+            openapi_url=OPENAPI_URL,
+            data_source=_data_source_status(),
+            job_store=_job_store_status(runtime),
+            audit=AuditStatus(
+                sink=audit_sink,
+                admission_authorized=audit_admission_authorized,
+                failure_count=audit_failure_count(),
+            ),
+            endpoints=_endpoint_statuses(production_runtime=_production_runtime()),
+            deployment_revision=(environ.get(DEPLOYMENT_REVISION_ENV) or "").strip() or None,
+        )
+
+    @app.post(
+        ANALYSIS_JOBS_PATH,
+        response_model=AnalysisJob,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Analysis Jobs"],
+    )
+    async def create_analysis_job(
+        request: CreateAnalysisJobRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
+        user_id: str = Depends(require_authenticated_identity),
+    ) -> AnalysisJob | JSONResponse:
+        """Queue the analysis and return the job immediately.
+
+        Against a live provider the graph runs for minutes - far past any reverse
+        proxy's read timeout - so running it inside the request turned every real
+        analysis into a 504. The job store, the per-stage progress on AnalysisJob and
+        GET /analysis-jobs/{job_id} already exist for exactly this shape: the client
+        polls the queued job instead of holding one long request open.
+        """
+
+        production_runtime = _production_runtime()
+        deferred_rule_draft_resolver: Callable[[str, str], RuleDraftV1] | None = None
+        # Every query uses the same admission and execution route.  An earlier special
+        # case bypassed research for one demonstration phrase; that behavior is gone,
+        # so the normal V3 resolution below is the sole production admission path.
+        if production_runtime:
+            # V2 is a deterministic development fallback for the old exploratory
+            # route.  It is not a semantic substitute for an unfamiliar strategy in
+            # production: only a V3 web-researched spec or a complete explicit V1
+            # rule may cross this admission boundary.
+            if isinstance(request.strategy_execution_spec, ExplorationExecutionSpecV2):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "strategy_research_required",
+                        "message": "이 전략은 AI 리서치로 의미를 확정한 뒤에만 검증할 수 있습니다. 잠시 후 다시 시도해 주세요.",
+                        "checks": ["live_provider_configuration"],
+                    },
+                )
+            readiness = _core_execution_readiness(
+                runtime,
+                migration_probe=migration_probe,
+                provider_ready=_live_provider_configuration_is_ready(),
+                rule_draft_signer=app.state.rule_draft_signer,
+            )
+            if readiness.status != "ready":
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "analysis_execution_unavailable",
+                        "message": "실데이터 전략 분석 실행 준비가 완료되지 않았습니다. 준비가 확인되면 같은 전략을 다시 실행할 수 있습니다.",
+                        "checks": [check.name for check in readiness.checks if not check.ready],
+                    },
+                )
+        if request.is_parse_bound:
+            signer = app.state.rule_draft_signer
+            spec = request.strategy_execution_spec
+            # ``is_parse_bound`` and the request validator make these non-null. Keep
+            # the defensive branch so a future model change cannot turn a malformed
+            # contract into a job creation attempt.
+            if signer is None or spec is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy parse verification is temporarily unavailable.",
+                )
+            if not spec.is_executable:
+                return _draft_conflict_response("draft_rule_mismatch")
+            if isinstance(spec, ExplorationExecutionSpecV2):
+                try:
+                    validate_exploration_spec_against_policy(
+                        spec,
+                        app.state.exploration_policy_resolver(),
+                    )
+                except ExplorationPolicyUnavailableError:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "exploration_policy_unavailable",
+                            "message": "탐색 정책을 확인할 수 없어 실행을 시작하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+                        },
+                    ) from None
+            idempotency_key = request.client_idempotency_key or ""
+            if not (
+                isinstance(store, ParseBoundJobAdmissionStore)
+                and isinstance(store, AnalysisJobOutboxStore)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                )
+            idempotency_status, existing_job_id = app.state.core_job_idempotency_registry.begin(
+                user_id=user_id,
+                key=idempotency_key,
+                spec_hash=request.spec_hash or "",
+            )
+            if idempotency_status == "conflict":
+                return _idempotency_conflict_response("idempotency_key_reused")
+            if idempotency_status == "pending":
+                return _idempotency_conflict_response("idempotency_in_progress")
+            if idempotency_status == "existing":
+                existing_job = store.get_job(existing_job_id or "")
+                if existing_job is not None:
+                    # Retrying is also a harmless recovery nudge if the first
+                    # response was interrupted before its post-response task started.
+                    background_tasks.add_task(
+                        _dispatch_analysis_and_research_outboxes,
+                        store,
+                        analysis_runner=analysis_runner,
+                        research_runner=app.state.research_appendix_runner,
+                        audit_sink=app.state.audit_sink,
+                        events=app.state.job_events,
+                        cancellations=app.state.job_cancellations,
+                    )
+                    return existing_job
+                # A stale local record must not turn a retry into a second paid run.
+                # A fresh process uses the durable admission record below instead.
+                return _idempotency_conflict_response("idempotency_in_progress")
+            if request.spec_hash != canonical_rule_digest(spec):
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response("draft_rule_mismatch")
+            try:
+                nonce = signer.verify(
+                    token=request.parse_token or "",
+                    rule=spec,
+                    user_id=user_id,
+                )
+            except DraftTokenValidationError as exc:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=idempotency_key,
+                    spec_hash=request.spec_hash or "",
+                )
+                return _draft_conflict_response(exc.code)
+            # Keep the user's original Korean request with the durable job.  The
+            # parse-bound ``spec`` remains the only authority for entry/exit rules,
+            # so retaining this text cannot change what is backtested.  It does let
+            # the later Research node explain the actual requested idea (for example
+            # RSI rebound, Bollinger breakout, or a value screen) instead of receiving
+            # a generic internal description of already-sealed candidates.
+            request_text = request.query or canonical_rule_execution_query(spec)
+            entrypoint = "api.analysis_jobs"
+        else:
+            # Natural-language browser submissions receive a job id immediately. The
+            # V3 parse then runs inside that job, so a web-grounded AOAI call cannot
+            # hold this HTTP request open long enough for the reverse proxy to reject
+            # it. The resolved execution spec remains the sole graph authority.
+            if request.query is None:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+            if production_runtime:
+                signer = app.state.rule_draft_signer
+                if signer is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Strategy parse verification is temporarily unavailable.",
+                    )
+                automatic = classify_strategy_request(request.query) == "automatic"
+                # A vague request is answered by the published catalogue tournament
+                # (three pre-registered candidates compared on identical data and
+                # costs), not by one rule an LLM invented for this query. This used
+                # to be hardcoded to None, which made the catalogue unreachable in
+                # production. An absent or stale policy is not a failure here: the
+                # draft builder falls back to V3 research, so this never 503s.
+                exploration_policy = None
+                if automatic and not app.state.strategy_parser_uses_llm:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "strategy_research_unavailable",
+                            "message": "낯선 전략은 AI 리서치로 의미를 확인한 뒤 검증합니다. 현재 리서치 서비스를 준비 중이니 잠시 후 다시 시도해 주세요.",
+                            "checks": ["live_provider_configuration"],
+                        },
+                    )
+                if automatic:
+                    try:
+                        exploration_policy = app.state.exploration_policy_resolver()
+                    except Exception:  # noqa: BLE001 - research fallback, not an outage.
+                        exploration_policy = None
+                try:
+                    # A live V3 research resolution is grounded in the actual server
+                    # capability catalogue before AOAI can propose a rule. This is a
+                    # short metadata read, unlike the remote research call itself.
+                    available_metrics = list(app.state.indicator_catalog_resolver() or ())
+                except ExplorationPolicyUnavailableError:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "exploration_policy_unavailable",
+                            "message": "탐색 정책을 확인할 수 없어 실행을 시작하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+                        },
+                    ) from None
+                except Exception:  # noqa: BLE001 - no job without a verified data catalog.
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Server indicator data is temporarily unavailable.",
+                    ) from None
+                if (app.state.strategy_parser_uses_llm or not automatic) and not available_metrics:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Server indicator data is temporarily unavailable.",
+                    )
+                if app.state.strategy_parser_uses_llm:
+
+                    def resolve_raw_job_rule_draft(query: str, trace_id: str) -> RuleDraftV1:
+                        return _build_rule_draft_with_audit(
+                            audit_sink=app.state.audit_sink,
+                            trace_id=trace_id,
+                            entrypoint="api.analysis_jobs.research",
+                            feature="strategy_research_resolution",
+                            client_request_id=request.client_idempotency_key,
+                            query=query,
+                            user_id=user_id,
+                            signer=signer,
+                            available_metrics=available_metrics,
+                            use_llm=True,
+                            exploration_policy=exploration_policy,
+                            propagate_provider_failure=True,
+                        )
+
+                    deferred_rule_draft_resolver = resolve_raw_job_rule_draft
+            request_text = request.query
+            entrypoint = "api.analysis_jobs"
+        if request.is_parse_bound:
+            # This lookup deliberately precedes quota consumption.  A process restart
+            # loses the in-memory retry fence, but the durable admission record still
+            # identifies an already accepted client idempotency key.  Retrying that
+            # request must return its original job without spending another provider
+            # allowance.
+            try:
+                existing_durable_job = store.find_parse_bound_job(
+                    user_id=user_id,
+                    spec_hash=request.spec_hash or "",
+                    client_idempotency_key=request.client_idempotency_key or "",
+                )
+            except ParseBoundAdmissionError as exc:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+                if exc.code == "idempotency_key_reused":
+                    return _idempotency_conflict_response("idempotency_key_reused")
+                return _draft_conflict_response("draft_replayed")
+            except JobStoreConfigurationError:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                ) from None
+            if existing_durable_job is not None:
+                app.state.core_job_idempotency_registry.complete(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                    job_id=existing_durable_job.job_id,
+                )
+                background_tasks.add_task(
+                    _dispatch_analysis_and_research_outboxes,
+                    store,
+                    analysis_runner=analysis_runner,
+                    research_runner=app.state.research_appendix_runner,
+                    audit_sink=app.state.audit_sink,
+                    events=app.state.job_events,
+                    cancellations=app.state.job_cancellations,
+                )
+                return existing_durable_job
+        job_created = True
+        try:
+            await require_authenticated_identity.consume_quota_after_admission(
+                http_request,
+                idempotency_key=(
+                    request.client_idempotency_key if request.is_parse_bound else None
+                ),
+            )
+            if request.is_parse_bound:
+                admission = store.admit_parse_bound_job(
+                    request_text,
+                    nonce_hash=_parse_nonce_hash(nonce),
+                    user_id=user_id,
+                    spec_version=request.spec_version or "",
+                    spec_hash=request.spec_hash or "",
+                    execution_spec=spec,
+                    client_idempotency_key=request.client_idempotency_key or "",
+                )
+                job = admission.job
+                job_created = admission.created
+            else:
+                job = store.create_job(request_text, user_id=user_id)
+        except ParseBoundAdmissionError as exc:
+            app.state.core_job_idempotency_registry.discard(
+                user_id=user_id,
+                key=request.client_idempotency_key or "",
+                spec_hash=request.spec_hash or "",
+            )
+            if exc.code == "idempotency_key_reused":
+                return _idempotency_conflict_response("idempotency_key_reused")
+            return _draft_conflict_response("draft_replayed")
+        except JobStoreConfigurationError:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Strategy execution admission is temporarily unavailable.",
+            ) from None
+        except ExplorationPolicyUnavailableError:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "exploration_policy_stale",
+                    "message": "확인한 탐색 정책이 바뀌어 실행을 시작하지 않았습니다. 다시 확인해 주세요.",
+                },
+            ) from None
+        except Exception:
+            if request.is_parse_bound:
+                app.state.core_job_idempotency_registry.discard(
+                    user_id=user_id,
+                    key=request.client_idempotency_key or "",
+                    spec_hash=request.spec_hash or "",
+                )
+            raise
+        if request.is_parse_bound:
+            app.state.core_job_idempotency_registry.complete(
+                user_id=user_id,
+                key=request.client_idempotency_key or "",
+                spec_hash=request.spec_hash or "",
+                job_id=job.job_id,
+            )
+        if request.is_parse_bound:
+            # The dispatch record was written with the job. A replay after a process
+            # restart can safely call this again: claim leasing selects it at most once.
+            background_tasks.add_task(
+                _dispatch_analysis_and_research_outboxes,
+                store,
+                analysis_runner=analysis_runner,
+                research_runner=app.state.research_appendix_runner,
+                audit_sink=app.state.audit_sink,
+                events=app.state.job_events,
+                cancellations=app.state.job_cancellations,
+            )
+        elif job_created:
+            background_tasks.add_task(
+                run_job_sync,
+                store,
+                job.job_id,
+                _build_analysis_runner_with_audit(
+                    analysis_runner,
+                    audit_sink=app.state.audit_sink,
+                    trace_id=job.trace_id,
+                    entrypoint=entrypoint,
+                    feature="analysis_job",
+                    user_id=user_id,
+                    rule_draft_resolver=deferred_rule_draft_resolver,
+                ),
+                events=app.state.job_events,
+                cancellations=app.state.job_cancellations,
+            )
+        return job
+
+    @app.post(
+        ANALYSIS_JOB_CANCEL_PATH,
+        response_model=AnalysisJob,
+        tags=["Analysis Jobs"],
+    )
+    def cancel_analysis_job(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> AnalysisJob:
+        """Ask a running analysis to stop at its next node boundary.
+
+        Requests already sent to the provider cannot be recalled, so this does not undo
+        what the run has already spent - it stops it before paying for the rest.
+        """
+
+        job = _owned_job(store, job_id, user_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        if job.result is not None:
+            # Already finished - nothing to stop, and the result stands.
+            return job
+        app.state.job_cancellations.cancel(job_id)
+        return job
+
+    @app.get(ANALYSIS_JOB_EVENTS_PATH, tags=["Analysis Jobs"])
+    async def stream_analysis_job_events(
+        job_id: str,
+        user_id: str = Depends(require_user),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        """Stream the running analysis's provider activity as Server-Sent Events.
+
+        Ownership is checked once up front: the job must exist and belong to the
+        caller before any events are handed out.
+
+        Every event carries its cursor as the SSE id, so a browser that reconnects
+        sends Last-Event-ID and resumes where it left off. Without that a reconnect
+        would replay the whole run - megabytes into a long analysis - which is enough
+        traffic to trigger the next drop.
+        """
+
+        if _owned_job(store, job_id, user_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+
+        try:
+            cursor = max(int(last_event_id), 0) if last_event_id else 0
+        except ValueError:
+            cursor = 0
+
+        async def event_source() -> AsyncIterator[str]:
+            nonlocal cursor
+            idle_polls = 0
+            while True:
+                events, cursor, closed = app.state.job_events.read_since(job_id, cursor)
+                first_id = cursor - len(events) + 1
+                for offset, event in enumerate(events):
+                    payload = json.dumps(event, ensure_ascii=False)
+                    yield f"id: {first_id + offset}\ndata: {payload}\n\n"
+                if closed and not events:
+                    yield "event: done\ndata: {}\n\n"
+                    return
+                if not events:
+                    idle_polls += 1
+                    # A quiet stream looks dead to intermediaries; a comment line keeps
+                    # the connection warm without reaching the EventSource consumer.
+                    if idle_polls * ANALYSIS_EVENT_POLL_SECONDS >= ANALYSIS_EVENT_KEEPALIVE_SECONDS:
+                        idle_polls = 0
+                        yield ": keepalive\n\n"
+                    await asyncio.sleep(ANALYSIS_EVENT_POLL_SECONDS)
+                else:
+                    idle_polls = 0
+
+        return StreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # Reverse proxies buffer by default, which would hold the whole stream
+                # until the analysis finished and defeat the point of streaming.
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get(
+        ANALYSIS_JOBS_PATH,
+        response_model=list[AnalysisJob],
+        tags=["Analysis Jobs"],
+    )
+    def list_analysis_jobs(
+        limit: int = Query(default=100, ge=1, le=100),
+        user_id: str = Depends(require_user),
+    ) -> list[AnalysisJob]:
+        owned_jobs = store.list_jobs(limit=limit, user_id=user_id)
+        return [
+            _public_job(job)
+            for job in sorted(owned_jobs, key=lambda job: job.updated_at, reverse=True)
+        ]
+
+    @app.post(
+        SPEC_STRATEGY_PARSE_PATH,
+        response_model=RuleDraftV1,
+        status_code=status.HTTP_200_OK,
+        tags=["Research Rule Review"],
+    )
+    async def parse_strategy(
+        request: ParseStrategyRequest,
+        user_id: str = Depends(require_authenticated_identity),
+    ) -> RuleDraftV1 | JSONResponse:
+        signer = app.state.rule_draft_signer
+        if signer is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Research rule review is temporarily unavailable.",
+            )
+        if (
+            _production_runtime()
+            and not resolve_database_dsn_from_env()[0]
+            and not runtime.dsn_configured
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server indicator data is temporarily unavailable.",
+            )
+        exploration_policy = None
+        available_metrics = None
+        automatic = classify_strategy_request(request.request_text) == "automatic"
+        if _production_runtime() and automatic and not app.state.strategy_parser_uses_llm:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "strategy_research_unavailable",
+                    "message": "낯선 전략은 AI 리서치로 의미를 확인한 뒤 검증합니다. 현재 리서치 서비스를 준비 중이니 잠시 후 다시 시도해 주세요.",
+                    "checks": ["live_provider_configuration"],
+                },
+            )
+        try:
+            # See raw admission above.  The browser review and direct admission
+            # endpoint must ask AOAI about exactly the same server-supported metric
+            # set; otherwise the user could approve a rule that the job endpoint
+            # cannot evaluate.
+            if app.state.strategy_parser_uses_llm:
+                available_metrics = app.state.indicator_catalog_resolver()
+            else:
+                available_metrics = app.state.indicator_catalog_resolver()
+        except ExplorationPolicyUnavailableError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "exploration_policy_unavailable",
+                    "message": "탐색 정책을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                },
+            ) from None
+        except Exception:  # noqa: BLE001 - parser admission must fail closed on data errors.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server indicator data is temporarily unavailable.",
+            ) from None
+        if (app.state.strategy_parser_uses_llm or not automatic) and not available_metrics:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server indicator data is temporarily unavailable.",
+            )
+        if automatic or not _production_runtime():
+            # Match raw admission: automatic requests need the published policy on
+            # the review path too. Other requests retain the development-only
+            # incomplete-parse fallback; release research semantics stay unchanged.
+            try:
+                exploration_policy = app.state.exploration_policy_resolver()
+            except Exception:  # noqa: BLE001 - optional incomplete-request fallback.
+                exploration_policy = None
+        if app.state.strategy_parser_uses_llm:
+            outcome = _build_rule_draft_with_audit(
+                audit_sink=app.state.audit_sink,
+                trace_id=f"parse-{uuid.uuid4()}",
+                entrypoint="api.strategy_parse",
+                feature="strategy_research_resolution",
+                client_request_id=request.client_request_id,
+                query=request.request_text,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                use_llm=True,
+                exploration_policy=exploration_policy,
+            )
+        else:
+            outcome = build_rule_draft(
+                query=request.request_text,
+                user_id=user_id,
+                signer=signer,
+                available_metrics=available_metrics,
+                use_llm=False,
+                exploration_policy=exploration_policy,
+            )
+        if outcome.is_executable:
+            if _production_runtime():
+                readiness = _core_execution_readiness(
+                    runtime,
+                    migration_probe=migration_probe,
+                    provider_ready=_live_provider_configuration_is_ready(),
+                    rule_draft_signer=signer,
+                )
+                if readiness.status != "ready":
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "code": "analysis_execution_unavailable",
+                            "message": "실데이터 전략 분석 실행 준비가 완료되지 않았습니다. 준비가 확인되면 같은 전략을 다시 실행할 수 있습니다.",
+                            "checks": [check.name for check in readiness.checks if not check.ready],
+                        },
+                    )
+            if not (
+                isinstance(store, ParseBoundJobAdmissionStore)
+                and isinstance(store, AnalysisJobOutboxStore)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                )
+            spec = outcome.strategy_execution_spec
+            parse_token = outcome.parse_token
+            if spec is None or parse_token is None or outcome.spec_hash is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                )
+            nonce = signer.verify(token=parse_token, rule=spec, user_id=user_id)
+            try:
+                store.register_parse_token(
+                    nonce_hash=_parse_nonce_hash(nonce),
+                    user_id=user_id,
+                    spec_version=outcome.spec_version or "",
+                    spec_hash=outcome.spec_hash,
+                    expires_at=outcome.expires_at,
+                )
+            except JobStoreConfigurationError:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Strategy execution admission is temporarily unavailable.",
+                ) from None
+        return outcome
+
+    @app.post(
+        RESEARCH_JOB_CREATE_PATH,
+        response_model=ResearchJobAcceptedV1,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Research Execution"],
+        responses={
+            status.HTTP_409_CONFLICT: {"model": DraftConflictV1},
+        },
+    )
+    async def create_confirmed_research_job(
+        request: ConfirmedResearchExecutionRequest,
+        background_tasks: BackgroundTasks,
+        http_request: Request,
+        user_id: str = Depends(require_authenticated_identity),
+    ) -> ResearchJobAcceptedV1 | JSONResponse:
+        if _production_runtime():
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=retired_public_create_detail(
+                    boundary_id="public-research-job-create",
+                    path=RESEARCH_JOB_CREATE_PATH,
+                    read_only_alternative="/api/v1/reports",
+                ),
+            )
+        signer = app.state.rule_draft_signer
+        if signer is None or not app.state.research_execution_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Research execution is not activated until operational evidence is available.",
+            )
+        if not request.canonical_rule.is_executable:
+            return _draft_conflict_response("draft_rule_mismatch")
+        try:
+            nonce = signer.verify(
+                token=request.draft_token,
+                rule=request.canonical_rule,
+                user_id=user_id,
+            )
+        except DraftTokenValidationError as exc:
+            return _draft_conflict_response(exc.code)
+        if not app.state.draft_nonce_registry.consume(user_id=user_id, nonce=nonce):
+            return _draft_conflict_response("draft_replayed")
+        await require_authenticated_identity.consume_quota_after_admission(http_request)
+        job = store.create_job(
+            canonical_rule_execution_query(request.canonical_rule),
+            user_id=user_id,
+            execution_spec_version=STRATEGY_EXECUTION_SPEC_VERSION,
+            execution_spec_hash=canonical_rule_digest(request.canonical_rule),
+            execution_spec=request.canonical_rule,
+        )
+        background_tasks.add_task(
+            run_job_sync,
+            store,
+            job.job_id,
+            _build_analysis_runner_with_audit(
+                analysis_runner,
+                audit_sink=app.state.audit_sink,
+                trace_id=job.trace_id,
+                entrypoint="api.research_jobs",
+                feature="research_job",
+                user_id=user_id,
+                execution_spec=request.canonical_rule,
+                execution_spec_hash=canonical_rule_digest(request.canonical_rule),
+            ),
+            events=app.state.job_events,
+            cancellations=app.state.job_cancellations,
+        )
+        return ResearchJobAcceptedV1(job_id=job.job_id)
+
+    @app.get(
+        RESEARCH_JOB_RESULT_PATH,
+        response_model=ResearchResultV1,
+        tags=["Research Execution"],
+    )
+    def get_research_job_result(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> ResearchResultV1:
+        if _owned_job(store, job_id, user_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="research job not found"
+            )
+        # This remains unavailable until result/lifecycle owners attach a durable result
+        # identity and verified PostgreSQL EOD provenance to the completed job.
+        return unavailable_result_for_unverified_job(job_id=job_id)
+
+    @app.post(
+        STRATEGY_DESCRIPTIONS_PATH,
+        response_model=StrategyDescriptionsResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["Strategy"],
+    )
+    def describe_strategies(
+        request: StrategyDescriptionsRequest,
+        user_id: str = Depends(require_user_within_quota),
+    ) -> StrategyDescriptionsResponse:
+        session = _open_request_audit_session(
+            app.state.audit_sink,
+            trace_id=None,
+            entrypoint="api.strategy_descriptions",
+            feature="strategy_descriptions",
+            user_id=user_id,
+        )
+        _record_step(
+            session, "descriptions_started", message=f"strategy_count={len(request.strategies)}"
+        )
+        try:
+            with bind_audit_context(session):
+                items: list[StrategyDescriptionItem] = []
+                for strategy in request.strategies:
+                    payload = generate_strategy_description(
+                        strategy_id=strategy.strategy_id,
+                        name=strategy.name,
+                        timeframe=strategy.timeframe,
+                        entry_summary=strategy.entry_summary,
+                        exit_summary=strategy.exit_summary,
+                        risk_summary=strategy.risk_summary,
+                        tags=strategy.tags,
+                        fallback=(
+                            f"{strategy.entry_summary} 조건이 맞는 종목을 선별하고 "
+                            f"{strategy.exit_summary} 기준으로 정리하는 전략입니다."
+                        ),
+                    )
+                    items.append(
+                        StrategyDescriptionItem(
+                            strategy_id=payload.strategy_id,
+                            description=payload.description,
+                            fallback_reasons=payload.fallback_reasons,
+                        )
+                    )
+                    _record_step(
+                        session,
+                        "description_generated",
+                        message=(
+                            f"strategy_id={payload.strategy_id} "
+                            f"fallback_used={'true' if payload.fallback_reasons else 'false'}"
+                        ),
+                    )
+        except Exception as exc:
+            _record_error(
+                session,
+                "description_generation",
+                error_type=type(exc).__name__,
+                message=f"{type(exc).__name__} raised during strategy description generation",
+            )
+            _record_finalization(
+                session, "failed", message="strategy description generation failed"
+            )
+            raise
+        _record_finalization(
+            session, "completed", message=f"generated {len(items)} strategy descriptions"
+        )
+        return StrategyDescriptionsResponse(items=items)
+
+    @app.get(
+        ANALYSIS_JOB_DETAIL_PATH,
+        response_model=AnalysisJob,
+        tags=["Analysis Jobs"],
+    )
+    def get_analysis_job(job_id: str, user_id: str = Depends(require_user)) -> AnalysisJob:
+        job = _owned_job(store, job_id, user_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        return _public_job(job)
+
+    @app.get(
+        ANALYSIS_JOB_RESEARCH_APPENDIX_PATH,
+        response_model=dict[str, object],
+        tags=["Analysis Jobs"],
+    )
+    def get_research_appendix(
+        job_id: str,
+        user_id: str = Depends(require_user),
+    ) -> dict[str, object]:
+        if _owned_job(store, job_id, user_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        if not isinstance(store, ResearchAppendixStore):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Research appendix is temporarily unavailable.",
+            )
+        appendix = store.get_research_appendix(job_id)
+        if appendix is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="research appendix not found",
+            )
+        return dict(appendix)
+
+    @app.get(
+        SPEC_ANALYSIS_JOB_DETAIL_PATH,
+        response_model=AnalysisJob,
+        tags=["Spec Compatibility"],
+    )
+    def get_spec_analysis_job(job_id: str, user_id: str = Depends(require_user)) -> AnalysisJob:
+        return get_analysis_job(job_id, user_id)
+
+    @app.get(
+        SPEC_BACKTEST_DETAIL_PATH,
+        response_model=APIEnvelope,
+        tags=["Spec Compatibility"],
+    )
+    def get_backtest(strategy_id: str, user_id: str = Depends(require_user)) -> APIEnvelope:
+        job = _find_job_by_strategy(store, strategy_id, user_id)
+        result = _public_envelope(job.result) if job and job.result else None
+        if result and result.user_payload.performance is not None:
+            return result
+        return _not_found_envelope(
+            resource_type="backtest",
+            resource_id=strategy_id,
+            message="No completed analysis job with backtest performance was found.",
+        )
+
+    @app.post("/demo/send-report", tags=["Demo"])
+    def demo_send_report(
+        request: DemoSendReportRequest,
+        user_id: str = Depends(require_user),
+    ) -> dict[str, object]:
+        """시연용: 완료된 분석 리포트를 SMTP로 실제 이메일 발송한다.
+
+        기존 Brevo/Resend outbox·worker 경로를 우회하는 데모 fallback이다. SMTP 크레덴셜은
+        서버 환경변수(DEMO_SMTP_*)에서만 읽으며, 미설정 시 어떻게 채우는지 400으로 안내한다.
+        """
+
+        job = _owned_job(store, request.job_id, user_id)
+        if job is None or job.result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="analysis job not found",
+            )
+        from ai_graph.demo_email import DemoEmailConfigError, send_demo_report
+
+        try:
+            return send_demo_report(job.result, request.recipient)
+        except DemoEmailConfigError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "demo_email_not_configured", "message": str(exc)},
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - 전송 실패 사유를 그대로 노출해 시연 디버깅을 돕는다.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "code": "demo_email_send_failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+
+    @app.get(
+        SPEC_REPORT_DETAIL_PATH,
+        tags=["Retired"],
+    )
+    def get_report(report_id: str) -> None:
+        """Keep public report delivery on the backend-owned immutable snapshot path."""
+
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail={
+                "code": "mutable_ai_report_projection_retired",
+                "message": "요청형 리포트는 보관된 읽기 전용 스냅샷에서만 제공합니다.",
+                "read_only_alternative": "/api/v1/reports",
+            },
+        )
+
+    @app.post(
+        DAILY_DIGEST_PATH,
+        tags=["Retired"],
+    )
+    def create_daily_digest() -> None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail={
+                "code": "daily_digest_retired",
+                "message": "정기 다이제스트 생성은 현재 제공하지 않습니다.",
+            },
+        )
+
+    return app
+
+
+def _endpoint_statuses(*, production_runtime: bool | None = None) -> list[EndpointStatus]:
+    """The public inventory of core execution and compatibility surfaces."""
+
+    release_runtime = _production_runtime() if production_runtime is None else production_runtime
+    return [
+        EndpointStatus(
+            method="GET",
+            path=HEALTH_PATH,
+            state="available",
+            summary="Service health and schema version.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=READINESS_PATH,
+            state="readiness",
+            summary="Fail-closed durable store, migration, and AI contract admission.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=API_STATUS_PATH,
+            state="available",
+            summary="Swagger-visible API surface summary.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=ANALYSIS_JOBS_PATH,
+            state="job_async",
+            summary=(
+                "Parse natural-language input on the server, seal the execution spec, and queue an authenticated analysis job."
+                if release_runtime
+                else "Queue a local development analysis job."
+            ),
+        ),
+        EndpointStatus(
+            method="GET",
+            path=ANALYSIS_JOBS_PATH,
+            state="job_store",
+            summary="List the authenticated user's analysis job history.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=ANALYSIS_JOB_DETAIL_PATH,
+            state="job_store",
+            summary="Read an analysis job from the configured job store.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=SPEC_STRATEGY_PARSE_PATH,
+            state="available",
+            summary="Natural-language strategy review against the configured server indicator catalog.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=RESEARCH_JOB_CREATE_PATH,
+            state="retired" if release_runtime else "local_sync",
+            summary=(
+                "Retired public research execution; use authenticated read-only report snapshots."
+                if release_runtime
+                else "Create a job only from a signed research rule when activation is explicitly enabled."
+            ),
+        ),
+        EndpointStatus(
+            method="GET",
+            path=RESEARCH_JOB_RESULT_PATH,
+            state="job_store",
+            summary="Read the safe ResearchResultV1 projection for an owned research job.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=STRATEGY_DESCRIPTIONS_PATH,
+            state="local_sync",
+            summary="Generate concise strategy-only descriptions for FE strategy cards.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=SPEC_ANALYSIS_JOB_DETAIL_PATH,
+            state="job_store",
+            summary="Compatibility adapter for polling analysis jobs.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=SPEC_BACKTEST_DETAIL_PATH,
+            state="job_store",
+            summary="MVP adapter returning the latest matching job envelope with backtest performance.",
+        ),
+        EndpointStatus(
+            method="GET",
+            path=SPEC_REPORT_DETAIL_PATH,
+            state="retired",
+            summary="Retired mutable report projection; use backend-owned read-only report snapshots.",
+        ),
+        EndpointStatus(
+            method="POST",
+            path=DAILY_DIGEST_PATH,
+            state="retired",
+            summary="Retired daily digest endpoint; no audit, LLM, or subscription work is available.",
+        ),
+    ]
+
+
+def _cors_allow_origins() -> list[str]:
+    raw_origins = environ.get(AI_CORS_ALLOW_ORIGINS_ENV, "")
+    return [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
+
+def _research_execution_enabled() -> bool:
+    raw = (environ.get(RESEARCH_EXECUTION_ENABLED_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _production_runtime() -> bool:
+    # Delegates so the API layer and the data layer cannot disagree about what a
+    # release profile is; the fixture guard in `data_sources.db` reads the same answer.
+    return is_release_profile()
+
+
+def _resolve_indicator_catalog() -> list[str] | None:
+    """Use measured PostgreSQL indicators when configured; keep local review usable."""
+
+    dsn, _ = resolve_database_dsn_from_env()
+    if dsn:
+        return available_indicator_metrics_from_env()
+    from ai_graph.nodes.condition_compiler import supported_metrics
+
+    # The release execution gate below still requires PostgreSQL before a job can run;
+    # keeping the static vocabulary here lets an operator inspect a draft while the
+    # catalog connection is being provisioned.
+    return supported_metrics()
+
+
+def _data_source_status() -> DataSourceStatus:
+    dsn_value, dsn_env = resolve_database_dsn_from_env()
+    return DataSourceStatus(
+        configured=dsn_value is not None,
+        dsn_env=dsn_env,
+        price_source=KIS_ADJUSTED_OHLCV_TABLE,
+        candidate_pool_source=SYMBOL_MASTER_TABLE,
+        l4_evidence_source=ANALYST_REPORT_TABLE,
+        macro_source=BOK_MACRO_VIEW,
+        macro_usable=False,
+        fallback_when_unset="fixture",
+    )
+
+
+def _release_readiness(
+    runtime: JobStoreRuntime,
+    *,
+    migration_probe: Callable[[], bool],
+    rule_draft_signer: RuleDraftSigner | None,
+    provider_ready: bool,
+) -> ReadinessResponse:
+    durable_store_ready = (
+        runtime.requested_mode == PERSISTENT_JOB_STORE_MODE
+        and runtime.active_mode == PERSISTENT_JOB_STORE_MODE
+        and not runtime.fallback
+        and runtime.dsn_configured
+    )
+    migration_ready = False
+    if durable_store_ready:
+        try:
+            migration_ready = bool(migration_probe())
+        except Exception:  # noqa: BLE001 - readiness must not leak dependency internals.
+            migration_ready = False
+    contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
+    rule_draft_signer_ready = rule_draft_signer is not None
+    cache_ready, cache_reason = backtest_cache_ready()
+    checks = [
+        ReadinessCheck(
+            name="durable_job_store",
+            ready=durable_store_ready,
+            reason=None if durable_store_ready else "durable_job_store_required",
+        ),
+        ReadinessCheck(
+            name="migration_revision",
+            ready=migration_ready,
+            reason=None if migration_ready else "migration_revision_required",
+        ),
+        ReadinessCheck(
+            name="live_provider_configuration",
+            ready=provider_ready,
+            reason=None if provider_ready else "live_provider_configuration_required",
+        ),
+        ReadinessCheck(
+            name="ai_contract_version",
+            ready=contract_ready,
+            reason=None if contract_ready else "ai_contract_version_mismatch",
+        ),
+        ReadinessCheck(
+            name="rule_draft_signer",
+            ready=rule_draft_signer_ready,
+            reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+        ReadinessCheck(
+            name="backtest_evaluation_cache",
+            ready=cache_ready,
+            reason=cache_reason,
+        ),
+    ]
+    return ReadinessResponse(
+        status="ready" if all(check.ready for check in checks) else "unavailable",
+        ai_contract_version=SCHEMA_VERSION,
+        checks=checks,
+    )
+
+
+def _core_execution_readiness(
+    runtime: JobStoreRuntime,
+    *,
+    migration_probe: Callable[[], bool],
+    provider_ready: bool,
+    rule_draft_signer: RuleDraftSigner | None,
+) -> ReadinessResponse:
+    """Admission checks for the primary natural-language strategy workflow.
+
+    The primary route verifies the parse-bound execution token before it creates a
+    durable job, so a release must have the signer that issued that token. This is not
+    a reason to remove the natural-language workflow: the parse endpoint stays public
+    to authenticated users and reports a typed unavailable state until configured.
+    """
+
+    durable_store_ready = (
+        runtime.requested_mode == PERSISTENT_JOB_STORE_MODE
+        and runtime.active_mode == PERSISTENT_JOB_STORE_MODE
+        and not runtime.fallback
+        and runtime.dsn_configured
+    )
+    migration_ready = False
+    if durable_store_ready:
+        try:
+            migration_ready = bool(migration_probe())
+        except Exception:  # noqa: BLE001 - public admission must not leak dependency internals.
+            migration_ready = False
+    contract_ready = SCHEMA_VERSION == REQUIRED_AI_CONTRACT_VERSION
+    rule_draft_signer_ready = rule_draft_signer is not None
+    cache_ready, cache_reason = backtest_cache_ready()
+    checks = [
+        ReadinessCheck(
+            name="durable_job_store",
+            ready=durable_store_ready,
+            reason=None if durable_store_ready else "durable_job_store_required",
+        ),
+        ReadinessCheck(
+            name="migration_revision",
+            ready=migration_ready,
+            reason=None if migration_ready else "migration_revision_required",
+        ),
+        ReadinessCheck(
+            name="live_provider_configuration",
+            ready=provider_ready,
+            reason=None if provider_ready else "live_provider_configuration_required",
+        ),
+        ReadinessCheck(
+            name="ai_contract_version",
+            ready=contract_ready,
+            reason=None if contract_ready else "ai_contract_version_mismatch",
+        ),
+        ReadinessCheck(
+            name="rule_draft_signer",
+            ready=rule_draft_signer_ready,
+            reason=None if rule_draft_signer_ready else "rule_draft_signer_required",
+        ),
+        ReadinessCheck(
+            name="backtest_evaluation_cache",
+            ready=cache_ready,
+            reason=cache_reason,
+        ),
+    ]
+    return ReadinessResponse(
+        status="ready" if all(check.ready for check in checks) else "unavailable",
+        ai_contract_version=SCHEMA_VERSION,
+        checks=checks,
+    )
+
+
+def _live_provider_configuration_is_ready() -> bool:
+    """Check only the presence of the production AOAI configuration.
+
+    Readiness must not instantiate an HTTP client or expose a credential.  The graph's
+    live provider factory requires this global fallback trio whenever a role does not
+    have a dedicated override, so requiring all three protects every role from silently
+    falling back to the local mock provider in a release profile.
+    """
+
+    provider = (environ.get(AI_LLM_PROVIDER_ENV) or "mock").strip().lower()
+    if provider != "aoai":
+        return False
+    return all(
+        bool((environ.get(key) or "").strip())
+        for key in (
+            AI_AOAI_RESPONSES_URL_ENV,
+            AI_AOAI_API_KEY_ENV,
+            AI_AOAI_MODEL_ENV,
+        )
+    )
+
+
+def _analysis_jobs_migration_is_current() -> bool:
+    """Check the durable-job schema signature without returning connection details."""
+
+    dsn, _ = resolve_database_dsn_from_env()
+    if dsn is None:
+        return False
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=3) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    to_regclass('app.ai_analysis_job') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'app'
+                          AND table_name = 'ai_analysis_job'
+                          AND column_name = 'execution_manifest_schema_version'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = 'ai_analysis_job_execution_manifest_v1_check'
+                          AND conrelid = 'app.ai_analysis_job'::regclass
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_class
+                        WHERE relname = 'idx_ai_analysis_job_execution_manifest_schema'
+                    ),
+                    to_regclass('app.analysis_result') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'app'
+                          AND table_name = 'ai_analysis_job'
+                          AND column_name = 'analysis_result_id'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_trigger
+                        WHERE tgname = 'trg_analysis_result_immutable'
+                          AND tgrelid = 'app.analysis_result'::regclass
+                    ),
+                    to_regclass('app.ai_parse_token') IS NOT NULL,
+                    to_regclass('app.ai_analysis_job_idempotency') IS NOT NULL,
+                    to_regclass('app.ai_analysis_job_outbox') IS NOT NULL,
+                    to_regclass('app.ai_exploration_policy') IS NOT NULL,
+                    to_regclass('app.ai_active_exploration_policy') IS NOT NULL,
+                    to_regclass('app.ai_research_appendix_event') IS NOT NULL,
+                    to_regclass('app.ai_research_appendix_outbox') IS NOT NULL,
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_class
+                        WHERE relname = 'idx_ai_analysis_job_outbox_pending'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_class
+                        WHERE relname = 'idx_ai_analysis_job_outbox_claim_lease'
+                    )
+                """
+            ).fetchone()
+    except Exception:  # noqa: BLE001 - readiness intentionally exposes only a bounded reason.
+        return False
+    return bool(row and all(row))
+
+
+def _job_store_runtime(job_store: AnalysisJobStore | None) -> JobStoreRuntime:
+    if job_store is None:
+        dsn, _ = resolve_database_dsn_from_env()
+        repository = PostgresAnalysisJobRepository(dsn) if dsn else None
+        return create_analysis_job_store_from_env(
+            repository=repository,
+            persistent_store_factory=PersistentAnalysisJobStore,
+        )
+    return JobStoreRuntime(
+        store=job_store,
+        requested_mode="injected",
+        active_mode=getattr(job_store, "store_mode", "injected"),
+        fallback=False,
+        fallback_reason=None,
+        dsn_configured=False,
+        mode_env=AI_JOB_STORE_ENV,
+    )
+
+
+def _job_store_status(runtime: JobStoreRuntime) -> JobStoreStatus:
+    return JobStoreStatus(
+        requested_mode=runtime.requested_mode,
+        active_mode=runtime.active_mode,
+        mode_env=runtime.mode_env,
+        dsn_env=runtime.dsn_env,
+        dsn_configured=runtime.dsn_configured,
+        fallback=runtime.fallback,
+        fallback_reason=runtime.fallback_reason,
+    )
+
+
+def _owned_job(store: AnalysisJobStore, job_id: str, user_id: str) -> AnalysisJob | None:
+    job = store.get_job(job_id)
+    return job if job is not None and job.user_id == user_id else None
+
+
+def _public_envelope(envelope: APIEnvelope | None) -> APIEnvelope | None:
+    """Return a response-safe copy without rewriting the persisted result."""
+
+    if envelope is None:
+        return None
+    performance = envelope.user_payload.performance
+    public_performance = sanitize_public_performance(
+        performance,
+        freshness_evidence=envelope.freshness_evidence,
+        freshness_status=envelope.freshness_status,
+    )
+    public_report = _public_report_performance(
+        envelope.user_payload.report,
+        performance=public_performance,
+    )
+    if public_performance is performance and public_report is envelope.user_payload.report:
+        return envelope
+    payload = envelope.user_payload.model_copy(
+        update={"performance": public_performance, "report": public_report}
+    )
+    return envelope.model_copy(update={"user_payload": payload})
+
+
+def _public_report_performance(
+    report: ReportBundle | None,
+    *,
+    performance: BaseModel | None,
+) -> ReportBundle | None:
+    """Keep legacy report sections aligned with the response-safe performance variant."""
+
+    if report is None or performance is None:
+        return report
+    safe_items = performance.model_dump(mode="json")
+
+    def sanitize_sections(sections: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [
+            {**section, "items": safe_items} if section.get("id") == "performance" else section
+            for section in sections
+        ]
+
+    web_sections = sanitize_sections(report.web_projection.sections)
+    email_sections = sanitize_sections(report.email_projection.sections)
+    if (
+        web_sections == report.web_projection.sections
+        and email_sections == report.email_projection.sections
+    ):
+        return report
+    return report.model_copy(
+        update={
+            "web_projection": report.web_projection.model_copy(update={"sections": web_sections}),
+            "email_projection": report.email_projection.model_copy(
+                update={"sections": email_sections}
+            ),
+        }
+    )
+
+
+def _public_job(job: AnalysisJob) -> AnalysisJob:
+    result = _public_envelope(job.result)
+    if result is job.result:
+        return job
+    return job.model_copy(update={"result": result})
+
+
+def _find_job_by_strategy(
+    store: AnalysisJobStore, strategy_id: str, user_id: str
+) -> AnalysisJob | None:
+    normalized = strategy_id.strip().lower()
+    for job in reversed(store.list_jobs(user_id=user_id)):
+        if not job.result or not job.result.strategy_spec:
+            continue
+        result_strategy_id = job.result.strategy_spec.strategy_id
+        if result_strategy_id == normalized or result_strategy_id.startswith(normalized):
+            return job
+    return None
+
+
+def _not_found_envelope(
+    *,
+    resource_type: str,
+    resource_id: str,
+    message: str,
+) -> APIEnvelope:
+    trace_id = f"not-found-{resource_type}"
+    return APIEnvelope(
+        status=EnvelopeStatus.FAILED,
+        trace_id=trace_id,
+        user_payload=UserPayload(
+            headline=f"{resource_type} not found",
+            message=f"{message} resource_id={resource_id}",
+            next_actions=[
+                "Run POST /api/strategies/parse first.",
+                "Poll the returned analysis job.",
+            ],
+        ),
+        strategy_spec=None,
+        debug_ref=f"not_found:{resource_type}:{resource_id}",
+        retryable=True,
+        failure_cause=FailureDiagnostic(
+            category="unknown_failure",
+            subcause="unknown",
+            failure_stage=Stage.FINALIZING,
+            owner="unknown",
+            retryable=True,
+            safe_message="요청한 분석 결과를 찾을 수 없습니다. 다시 확인해 주세요.",
+            evidence_refs=["failure:resource_not_found"],
+        ),
+    )
+
+
+app = create_app()

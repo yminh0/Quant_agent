@@ -1,0 +1,1062 @@
+name: Production backtest smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Test target
+        required: true
+        default: deployed-backtest
+        type: choice
+        options:
+          - deployed-backtest
+          - live-aoai
+          - live-full-analysis
+          - live-audit
+          - server-diagnostics
+          - analysis-job-inventory
+          - pipeline-load-timing
+          - trace-diagnostic
+          - dev-aoai-request-diagnostic
+          - dev-job-diagnostic
+      job_id:
+        description: Development analysis job ID for safe diagnostics
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-backtest-smoke
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    name: Run deployed full analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST || 'quant-agent.kro.kr' }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT || '30233' }}
+      SERVER_USER: ${{ secrets.SERVER_USER || 'etluser' }}
+      # 같은 파일 630·760행이 이미 $HOME/mvp_sp2/quant-proj를 하드코딩하고 있었다. mvp_sp1의
+      # .run/combined.pid는 죽은 pid를 담고 있어 일부 모드는 그것을 읽고 엉뚱한 곳에서 실패하고,
+      # 일부는 낡은 트리의 venv로 벤치마크를 끝내 green으로 보고했다.
+      SERVER_APP_DIR: ${{ secrets.NODE3_APP_DIR || '/home/etluser/mvp_sp2/quant-proj' }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      AOAI_RUN_ROOT: /tmp/quant-agent-aoai-${{ github.run_id }}
+
+    steps:
+      - name: Checkout branch benchmark
+        if: ${{ inputs.mode == 'deployed-backtest' || inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
+        uses: actions/checkout@v4
+
+      - name: Validate required secret
+        run: test -n "$SSH_PRIVATE_KEY"
+
+      - name: Configure SSH
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          for attempt in 1 2 3; do
+            ssh-keyscan -T 10 -p "$SERVER_PORT" "$SERVER_HOST" >> "$HOME/.ssh/known_hosts" \
+              && break
+            test "$attempt" = 3 && exit 1
+            sleep 2
+          done
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Stage branch benchmark without deploying
+        if: ${{ inputs.mode == 'deployed-backtest' || inputs.mode == 'live-aoai' || inputs.mode == 'live-full-analysis' }}
+        run: |
+          tar -czf branch-source.tgz ai backtest_module
+          scp -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -P "$SERVER_PORT" \
+            branch-source.tgz \
+            "$SERVER_USER@$SERVER_HOST:$AOAI_RUN_ROOT.tgz"
+
+      - name: Read server resource state
+        if: ${{ inputs.mode == 'server-diagnostics' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" <<'REMOTE'
+          set -Eeuo pipefail
+          uptime
+          nproc
+          free -h
+          df -h /tmp
+          ps -eo pid,ppid,etime,pcpu,pmem,rss,stat,comm,args --sort=-pcpu | sed -n '1,30p'
+          REMOTE
+
+      - name: Inventory analysis job rows against the decodability contract
+        if: ${{ inputs.mode == 'analysis-job-inventory' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -s "$PID_FILE"
+          PID="$(cat "$PID_FILE")"
+          [[ "$PID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$PID/environ"
+          cd "$APP_DIR/ai"
+          "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          # Read-only. Reports what migration 023 did and whether the live table now
+          # satisfies the decodability contract it was supposed to close.
+          import json
+          import psycopg
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          DECODABLE = """(
+              COALESCE(jsonb_typeof(job_jsonb -> 'execution_manifest'), 'absent') = 'object'
+              AND job_jsonb #>> '{execution_manifest,schema_version}' = '1'
+              AND job_jsonb #>> '{execution_manifest,contract_hash}' ~ '^[0-9a-f]{64}$'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,run_identity}'), 'absent') = 'object'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,policy_hashes}'), 'absent') = 'object'
+              AND job_jsonb #> '{execution_manifest,policy_hashes}' <> '{}'::jsonb
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,session}'), 'absent') = 'object'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,capabilities}'), 'absent') = 'object'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,signals}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,orders}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,fills}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,positions}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,trades}'), 'absent') = 'array'
+              AND COALESCE(jsonb_typeof(job_jsonb #> '{execution_manifest,events,equity}'), 'absent') = 'array'
+              AND (
+                  COALESCE(jsonb_typeof(job_jsonb #> '{result,performance}'), 'absent') <> 'object'
+                  OR job_jsonb #>> '{result,performance,availability}' IN ('available', 'unavailable')
+              )
+          ) IS TRUE"""
+
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+          with psycopg.connect(dsn) as conn:
+              live = conn.execute(
+                  "SELECT job_jsonb ->> 'status',"
+                  " COALESCE(jsonb_typeof(job_jsonb -> 'execution_manifest'), 'absent'),"
+                  " count(*), min(created_at)::date::text, max(created_at)::date::text"
+                  " FROM app.ai_analysis_job GROUP BY 1, 2 ORDER BY 3 DESC"
+              ).fetchall()
+              undecodable_left = conn.execute(
+                  f"SELECT count(*) FROM app.ai_analysis_job WHERE NOT {DECODABLE}"
+              ).fetchone()[0]
+              archived = conn.execute(
+                  "SELECT archive_reason, count(*), min(created_at)::date::text,"
+                  " max(created_at)::date::text, max(archived_at)::date::text"
+                  " FROM app.ai_analysis_job_legacy GROUP BY 1 ORDER BY 2 DESC"
+              ).fetchall()
+              constraints = conn.execute(
+                  "SELECT conname, convalidated FROM pg_constraint"
+                  " WHERE conrelid = 'app.ai_analysis_job'::regclass AND contype = 'c'"
+                  " ORDER BY conname"
+              ).fetchall()
+
+          print(json.dumps({
+              "live_rows": [
+                  {"status": row[0], "manifest": row[1], "count": row[2],
+                   "oldest": row[3], "newest": row[4]}
+                  for row in live
+              ],
+              "live_total": sum(row[2] for row in live),
+              "undecodable_still_live": undecodable_left,
+              "archived": [
+                  {"reason": row[0], "count": row[1], "oldest": row[2],
+                   "newest": row[3], "archived_at": row[4]}
+                  for row in archived
+              ],
+              "archived_total": sum(row[1] for row in archived),
+              "check_constraints": {name: validated for name, validated in constraints},
+          }, ensure_ascii=False, sort_keys=True))
+          PY
+          REMOTE
+
+      - name: Time one pipeline data load
+        if: ${{ inputs.mode == 'pipeline-load-timing' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -s "$PID_FILE"
+          PID="$(cat "$PID_FILE")"
+          [[ "$PID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*|AI_DB_*=*) export "$entry" ;;
+            esac
+          done < "/proc/$PID/environ"
+          echo "load average before: $(cut -d' ' -f1-3 /proc/loadavg)"
+          cd "$APP_DIR/ai"
+          AI_LLM_PROVIDER=mock "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          # The fenced backend runner calls load_pipeline_data_from_env() once per
+          # invocation. The graph calls it once per analysis and reuses the prepared
+          # market data across every candidate and self-improvement round. This measures
+          # what routing each candidate through that runner would cost per candidate.
+          import json
+          import time
+
+          from ai_graph.data_sources import load_pipeline_data_from_env
+
+          PROMPT = "삼성전자 RSI 30 이하 매수 70 이상 매도 최근 1년 백테스트"
+          samples = []
+          rows = 0
+          for index in range(3):
+              started = time.perf_counter()
+              pipeline = load_pipeline_data_from_env(PROMPT, f"pipeline-load-timing-{index}")
+              samples.append(round(time.perf_counter() - started, 3))
+              rows = len(pipeline.price_rows or ())
+              time.sleep(2)
+
+          print(json.dumps({
+              "seconds_per_load": samples,
+              "median_seconds": sorted(samples)[len(samples) // 2],
+              "price_rows": rows,
+          }, sort_keys=True))
+          PY
+          echo "load average after: $(cut -d' ' -f1-3 /proc/loadavg)"
+          REMOTE
+
+      - name: Run live AOAI and branch backtest benchmarks
+        if: ${{ inputs.mode == 'live-aoai' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$AOAI_RUN_ROOT" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          RUN_ROOT="$2"
+          ARCHIVE="$RUN_ROOT.tgz"
+          case "$RUN_ROOT" in
+            /tmp/quant-agent-aoai-[0-9]*) ;;
+            *) printf 'Unsafe benchmark path: %s\n' "$RUN_ROOT" >&2; exit 2 ;;
+          esac
+          trap 'rm -rf -- "$RUN_ROOT"; rm -f -- "$ARCHIVE"' EXIT
+          rm -rf -- "$RUN_ROOT"
+          mkdir -p "$RUN_ROOT"
+          tar -xzf "$ARCHIVE" -C "$RUN_ROOT"
+
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          # If AOAI settings belong only to the running API process, copy just those
+          # variables into this shell without printing their values.
+          if [ -z "${AI_AOAI_RESPONSES_URL:-}" ] \
+            && [ -s "$APP_DIR/.run/ai.pid" ]; then
+            AI_PID="$(cat "$APP_DIR/.run/ai.pid")"
+            if [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]] \
+              && [ -r "/proc/$AI_PID/environ" ]; then
+              while IFS= read -r -d '' entry; do
+                case "$entry" in
+                  AI_AOAI_*=*|AI_LLM_BACKTEST_CODE_*=*) export "$entry" ;;
+                esac
+              done < "/proc/$AI_PID/environ"
+            fi
+          fi
+
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          export AI_LLM_PROVIDER=aoai
+          export AI_AOAI_LIVE_TEST=1
+          cd "$RUN_ROOT/ai"
+          PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u \
+            "$RUN_ROOT/ai/scripts/benchmark_live_aoai_backtest.py"
+
+          export AI_DB_STATEMENT_TIMEOUT_MS=180000
+          export AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS=300000
+          export AI_BACKTEST_WORKERS=2
+          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
+          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
+          PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u \
+            "$RUN_ROOT/ai/scripts/run_production_backtest_benchmark.py" \
+            --llm-provider aoai \
+            --max-wall-seconds 600 \
+            --repeat-cache
+          REMOTE
+
+      - name: Run full live AOAI analysis
+        if: ${{ inputs.mode == 'live-full-analysis' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=40 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$AOAI_RUN_ROOT" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          RUN_ROOT="$2"
+          ARCHIVE="$RUN_ROOT.tgz"
+          case "$RUN_ROOT" in
+            /tmp/quant-agent-aoai-[0-9]*) ;;
+            *) printf 'Unsafe benchmark path: %s\n' "$RUN_ROOT" >&2; exit 2 ;;
+          esac
+          trap 'rm -rf -- "$RUN_ROOT"; rm -f -- "$ARCHIVE"' EXIT
+          rm -rf -- "$RUN_ROOT"
+          mkdir -p "$RUN_ROOT"
+          tar -xzf "$ARCHIVE" -C "$RUN_ROOT"
+
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          if [ -z "${AI_AOAI_RESPONSES_URL:-}" ] \
+            && [ -s "$APP_DIR/.run/ai.pid" ]; then
+            AI_PID="$(cat "$APP_DIR/.run/ai.pid")"
+            if [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]] \
+              && [ -r "/proc/$AI_PID/environ" ]; then
+              while IFS= read -r -d '' entry; do
+                case "$entry" in
+                  AI_AOAI_*=*|AI_LLM_*=*|AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) \
+                    export "$entry" ;;
+                esac
+              done < "/proc/$AI_PID/environ"
+            fi
+          fi
+
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          export AI_LLM_PROVIDER=aoai
+          export AI_AOAI_LIVE_TEST=1
+          export AI_DB_STATEMENT_TIMEOUT_MS=180000
+          export AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS=300000
+          export AI_BACKTEST_WORKERS=2
+          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
+          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
+          unset AI_MEMORY_PATH
+          cd "$RUN_ROOT/ai"
+          PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u \
+            "$RUN_ROOT/ai/scripts/benchmark_live_aoai_full_analysis.py" \
+            --max-wall-seconds 1200
+          REMOTE
+
+      - name: Run deployed AOAI audit round trip
+        if: ${{ inputs.mode == 'live-audit' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=40 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$GITHUB_RUN_ID" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          RUN_ID="$2"
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          test -s "$APP_DIR/.run/ai.pid"
+          AI_PID="$(cat "$APP_DIR/.run/ai.pid")"
+          [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
+          test -r "/proc/$AI_PID/environ"
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              APP_ENV=*|AI_AUDIT_*=*|AI_AOAI_*=*|AI_LLM_*=*|AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) \
+                export "$entry" ;;
+            esac
+          done < "/proc/$AI_PID/environ"
+
+          test "${APP_ENV:-}" = production
+          test "${AI_AUDIT_PRODUCTION_ENABLED:-}" = 1
+          test "${AI_AUDIT_SINK:-}" = postgres
+          test "${AI_AUDIT_GATE_B_ADMISSION_REVOCATION_STATE:-}" = active
+          test "${AI_LLM_PROVIDER:-}" = aoai
+          export AI_DB_STATEMENT_TIMEOUT_MS=180000
+          export AI_DB_BACKTEST_STATEMENT_TIMEOUT_MS=300000
+          export AI_BACKTEST_WALL_BUDGET_SECONDS=540
+          export AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS=180
+          export AUDIT_SMOKE_TRACE_ID="production-ai-audit-$RUN_ID"
+
+          cd "$APP_DIR/ai"
+          "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          import json
+          import os
+
+          import psycopg
+
+          from ai_graph.audit_postgres import AuthorizedAuditSink, create_audit_sink_from_env
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+          from ai_graph.graph import run_analysis
+
+          if not isinstance(create_audit_sink_from_env(), AuthorizedAuditSink):
+              raise RuntimeError("deployed audit sink is not authorized")
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+
+          public_trace_id = os.environ["AUDIT_SMOKE_TRACE_ID"]
+          result = run_analysis(
+              "삼성전자 005930을 RSI 30 이하에서 매수하고 70 이상에서 매도해 최근 1년을 백테스트해줘",
+              trace_id=public_trace_id,
+              audit_entrypoint="production.audit_smoke",
+              audit_feature="production_audit_smoke",
+          )
+
+          with psycopg.connect(dsn) as conn:
+              trace = conn.execute(
+                  """
+                  SELECT trace_id, status
+                  FROM app.ai_trace
+                  WHERE metadata_jsonb->>'public_trace_id' = %s
+                  ORDER BY started_at DESC
+                  LIMIT 1
+                  """,
+                  (public_trace_id,),
+              ).fetchone()
+              if trace is None:
+                  raise RuntimeError("audit trace was not persisted")
+              db_trace_id, trace_status = trace
+              counts = conn.execute(
+                  """
+                  SELECT
+                      (SELECT count(*) FROM app.ai_agent_execution_log
+                       WHERE trace_id = %s),
+                      (SELECT count(*) FROM app.ai_model_call_log
+                       WHERE trace_id = %s),
+                      (SELECT count(*) FROM app.ai_model_call_log
+                       WHERE trace_id = %s AND provider = 'aoai'
+                         AND status = 'succeeded'),
+                      (SELECT count(*) FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s
+                         AND length(prompt.assistant_response) > 0),
+                      (SELECT count(*) FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s
+                         AND length(prompt.assistant_response_summary) > 0),
+                      (SELECT coalesce(sum(length(prompt.assistant_response)), 0)
+                       FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s),
+                      (SELECT coalesce(sum(length(prompt.assistant_response_summary)), 0)
+                       FROM app.ai_prompt_log AS prompt
+                       JOIN app.ai_model_call_log AS model USING (call_id)
+                       WHERE model.trace_id = %s),
+                      (SELECT count(*) FROM app.ai_error_log WHERE trace_id = %s)
+                  """,
+                  (db_trace_id,) * 8,
+              ).fetchone()
+
+          (
+              agent_executions,
+              model_calls,
+              aoai_succeeded,
+              raw_responses,
+              summaries,
+              raw_chars,
+              summary_chars,
+              errors,
+          ) = counts
+          envelope_status = result.status.value
+          output = {
+              "agent_executions": agent_executions,
+              "aoai_succeeded": aoai_succeeded,
+              "deployment_revision": os.environ[
+                  "AI_AUDIT_GATE_B_DEPLOYMENT_REVISION"
+              ][:12],
+              "envelope_status": envelope_status,
+              "errors": errors,
+              "model_calls": model_calls,
+              "provider": "aoai",
+              "raw_chars": raw_chars,
+              "raw_responses": raw_responses,
+              "summaries": summaries,
+              "summary_chars": summary_chars,
+              "trace_id": public_trace_id,
+              "trace_status": trace_status,
+          }
+          print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+          if (
+              envelope_status != "ready"
+              or trace_status != "completed"
+              or model_calls < 1
+              or aoai_succeeded != model_calls
+              or raw_responses != model_calls
+              or summaries != model_calls
+              or errors != 0
+          ):
+              raise RuntimeError("production AOAI audit round trip failed")
+          PY
+          REMOTE
+
+      - name: Diagnose recent deployed analysis failures
+        if: ${{ inputs.mode == 'trace-diagnostic' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$1"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -s "$PID_FILE"
+          PID="$(cat "$PID_FILE")"
+          [[ "$PID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$PID/environ"
+          cd "$APP_DIR/ai"
+          "$APP_DIR/ai/.venv/bin/python" -u <<'PY'
+          import json
+          import os
+          import re
+          import psycopg
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+          with psycopg.connect(dsn) as conn:
+              errors = conn.execute(
+                  """
+                  SELECT t.metadata_jsonb->>'public_trace_id', t.status,
+                         e.error_type, e.error_message, e.stack_trace,
+                         e.context_jsonb, e.created_at
+                  FROM app.ai_error_log AS e
+                  JOIN app.ai_trace AS t USING (trace_id)
+                  WHERE e.created_at >= now() - interval '45 minutes'
+                  ORDER BY e.created_at DESC
+                  LIMIT 20
+                  """
+              ).fetchall()
+              jobs = conn.execute(
+                  """
+                  SELECT job_id, job_jsonb->>'trace_id', job_jsonb->>'error_message',
+                         job_jsonb->'fallback_reasons', updated_at
+                  FROM app.ai_analysis_job
+                  WHERE job_jsonb->>'status' = 'failed'
+                    AND updated_at >= now() - interval '45 minutes'
+                  ORDER BY updated_at DESC
+                  LIMIT 20
+                  """
+              ).fetchall()
+          redact = lambda value: re.sub(
+              r"(?i)(postgres(?:ql)?://)[^\s'\"]+", r"\1[redacted]", str(value)
+          )
+          print(json.dumps({
+              "errors": [
+                  {
+                      "public_trace_id": row[0], "trace_status": row[1],
+                      "error_type": row[2], "error_message": redact(row[3]),
+                      "stack_trace": redact(row[4])[-4000:],
+                      "context": row[5], "created_at": row[6].isoformat(),
+                  }
+                  for row in errors
+              ],
+              "failed_jobs": [
+                  {
+                      "job_id": str(row[0]), "trace_id": row[1],
+                      "error_message": redact(row[2]), "fallback_reasons": row[3],
+                      "updated_at": row[4].isoformat(),
+                  }
+                  for row in jobs
+              ],
+          }, ensure_ascii=False, sort_keys=True))
+          PY
+          REMOTE
+
+      - name: Diagnose node3 development AOAI request shapes
+        if: ${{ inputs.mode == 'dev-aoai-request-diagnostic' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -s "$PID_FILE"
+          AI_PID="$(cat "$PID_FILE")"
+          [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
+          test -r "/proc/$AI_PID/environ"
+
+          # Use the running development service's exact provider and data-source
+          # environment, but never print any configuration value.
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_AOAI_*=*|AI_LLM_*=*|AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$AI_PID/environ"
+          export AI_LLM_PROVIDER=aoai
+
+          cd "$APP_DIR"
+          PYTHONPATH="$APP_DIR/ai:$APP_DIR/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u - <<'PY'
+          import json
+
+          import httpx
+
+          from ai_graph.llm.aoai import AOAIResponsesClient
+          from ai_graph.llm.base import LLMClientError
+          from ai_graph.llm.factory import create_llm_client
+          from ai_graph.data_sources.sectors import get_known_sectors
+          from ai_graph.nodes.condition_compiler import supported_metrics
+          from ai_graph.nodes.strategy_research import _request
+
+          query = "삼성전자 RSI 전략을 최근 1년으로 검증해줘"
+          request = _request(
+              query=query,
+              allowed_metrics=supported_metrics(),
+              allowed_sectors=get_known_sectors(),
+          )
+          client = create_llm_client(role="STRATEGY_RESEARCH")
+          if not isinstance(client, AOAIResponsesClient):
+              raise RuntimeError("node3 development process is not configured for AOAI")
+          full = client._request_body(request)
+
+          def fields(body):
+              tool = body.get("tools", [{}])[0] if body.get("tools") else {}
+              return {
+                  "service_tier_sent": "service_tier" in body,
+                  "reasoning_sent": "reasoning" in body,
+                  "max_tool_calls_sent": "max_tool_calls" in body,
+                  "web_search_sent": tool.get("type") == "web_search",
+                  "search_context_size_sent": "search_context_size" in tool,
+                  "structured_output_sent": "text" in body,
+              }
+
+          def report(name, body):
+              try:
+                  response = httpx.post(
+                      client.responses_url,
+                      headers={"Content-Type": "application/json", "api-key": client.api_key},
+                      json=body,
+                      # Exercise the role's live timeout policy rather than the
+                      # generic 45-second client default. Strategy research uses
+                      # web search and is deliberately allowed a longer response
+                      # window by the deployed factory.
+                      timeout=client.timeout_seconds,
+                  )
+              except httpx.HTTPError as exc:
+                  return {"case": name, "result": "transport_error", "exception": type(exc).__name__, **fields(body)}
+              try:
+                  error = response.json().get("error") if response.status_code >= 400 else None
+              except ValueError:
+                  error = None
+              safe_error = error if isinstance(error, dict) else {}
+              return {
+                  "case": name,
+                  "result": "success" if 200 <= response.status_code < 300 else "http_error",
+                  "status_code": response.status_code,
+                  "error_type": safe_error.get("type") if isinstance(safe_error.get("type"), str) else None,
+                  "error_code": safe_error.get("code") if isinstance(safe_error.get("code"), str) else None,
+                  "error_param": safe_error.get("param") if isinstance(safe_error.get("param"), str) else None,
+                  **fields(body),
+              }
+
+          base = {key: full[key] for key in ("model", "input")}
+          cases = [
+              ("base", base),
+              ("budgets", {**base, **{key: full[key] for key in ("max_output_tokens", "reasoning", "max_tool_calls") if key in full}}),
+              ("structured_output", {**base, "text": full["text"]}),
+              ("web_search", {**base, "tools": full["tools"]}),
+              ("full_strategy_intent", full),
+          ]
+          results = [report(name, body) for name, body in cases]
+          try:
+              # A successful HTTP response alone is insufficient: the production
+              # failure was valid HTTP containing JSON truncated at the output limit.
+              # Use the deployed client to prove it can parse the complete, strict
+              # strategy-research contract without exposing model output.
+              client.generate_json(request)
+              results.append({
+                  "case": "full_strategy_parse",
+                  "result": "success",
+                  **fields(full),
+              })
+          except LLMClientError as exc:
+              results.append({
+                  "case": "full_strategy_parse",
+                  "result": "client_error",
+                  "exception": type(exc).__name__,
+                  **fields(full),
+              })
+          print(json.dumps({"provider": "aoai", "results": results}, ensure_ascii=False, sort_keys=True))
+          if any(item["result"] != "success" for item in results):
+              raise SystemExit(1)
+          PY
+          REMOTE
+
+      - name: Diagnose one node3 development analysis job safely
+        if: ${{ inputs.mode == 'dev-job-diagnostic' }}
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$JOB_ID" <<'REMOTE'
+          set -Eeuo pipefail
+          APP_DIR="$HOME/mvp_sp2/quant-proj"
+          PID_FILE="$APP_DIR/.run/combined.pid"
+          JOB_ID="$1"
+          [[ "$JOB_ID" =~ ^job_[A-Za-z0-9]+$ ]]
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -s "$PID_FILE"
+          AI_PID="$(cat "$PID_FILE")"
+          [[ "$AI_PID" =~ ^[1-9][0-9]*$ ]]
+          test -r "/proc/$AI_PID/environ"
+          while IFS= read -r -d '' entry; do
+            case "$entry" in
+              AI_DATABASE_DSN=*|QUANT_DB_DSN=*|DATABASE_URL=*) export "$entry" ;;
+            esac
+          done < "/proc/$AI_PID/environ"
+
+          cd "$APP_DIR"
+          PYTHONPATH="$APP_DIR/ai:$APP_DIR/backtest_module" \
+            "$APP_DIR/ai/.venv/bin/python" -u - "$JOB_ID" "$AI_PID" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          import psycopg
+
+          from ai_graph.data_sources.db import resolve_database_dsn_from_env
+
+          job_id, ai_pid = sys.argv[1:]
+          if not re.fullmatch(r"job_[A-Za-z0-9]+", job_id):
+              raise RuntimeError("invalid job identifier")
+          if not re.fullmatch(r"[1-9][0-9]*", ai_pid):
+              raise RuntimeError("invalid service process identifier")
+          dsn, _ = resolve_database_dsn_from_env()
+          if not dsn:
+              raise RuntimeError("database DSN is not configured")
+
+          markers = (
+              "LLMTimeoutError",
+              "LLMConnectionError",
+              "LLMHTTPStatusError",
+              "LLMResponseParseError",
+              "StrategyResearchError",
+          )
+          with psycopg.connect(dsn) as conn:
+              job = conn.execute(
+                  """
+                  SELECT job_jsonb ->> 'status', job_jsonb ->> 'polling_stage',
+                         job_jsonb ->> 'trace_id',
+                         job_jsonb #>> '{result,status}',
+                         job_jsonb #>> '{result,failure_cause,category}',
+                         job_jsonb #>> '{result,failure_cause,subcause}',
+                         job_jsonb #>> '{result,failure_cause,failure_stage}',
+                         job_jsonb #>> '{result,failure_cause,owner}',
+                         job_jsonb #>> '{result,failure_cause,retryable}',
+                         created_at, updated_at
+                  FROM app.ai_analysis_job
+                  WHERE job_id = %s
+                  """,
+                  (job_id,),
+              ).fetchone()
+              if job is None:
+                  raise RuntimeError("analysis job not found")
+              public_trace_id = job[2]
+              trace = conn.execute(
+                  """
+                  SELECT trace_id
+                  FROM app.ai_trace
+                  WHERE metadata_jsonb ->> 'public_trace_id' = %s
+                  ORDER BY started_at DESC
+                  LIMIT 1
+                  """,
+                  (public_trace_id,),
+              ).fetchone()
+              audit_trace_id = trace[0] if trace else None
+              model_rows = []
+              error_rows = []
+              agent_rows = []
+              trace_row = None
+              outbox_rows = conn.execute(
+                  """
+                  SELECT status, created_at, claimed_at, delivered_at
+                  FROM app.ai_analysis_job_outbox
+                  WHERE job_id = %s
+                  ORDER BY created_at
+                  """,
+                  (job_id,),
+              ).fetchall()
+              if audit_trace_id is not None:
+                  trace_row = conn.execute(
+                      """
+                      SELECT status, started_at, ended_at
+                      FROM app.ai_trace
+                      WHERE trace_id = %s
+                      """,
+                      (audit_trace_id,),
+                  ).fetchone()
+                  agent_rows = conn.execute(
+                      """
+                      SELECT agent_name, status, started_at, ended_at, latency_ms,
+                             CASE
+                               WHEN ended_at IS NULL AND started_at IS NOT NULL
+                               THEN floor(extract(epoch FROM now() - started_at))::integer
+                               ELSE NULL
+                             END AS running_seconds
+                      FROM app.ai_agent_execution_log
+                      WHERE trace_id = %s
+                      ORDER BY started_at, agent_name
+                      """,
+                      (audit_trace_id,),
+                  ).fetchall()
+                  model_rows = conn.execute(
+                      """
+                      SELECT task_type, provider, status, web_search_used, retry_count,
+                             error_message, count(*)
+                      FROM app.ai_model_call_log
+                      WHERE trace_id = %s
+                      GROUP BY 1, 2, 3, 4, 5, 6
+                      ORDER BY 1, 2, 3, 4, 5, 6
+                      """,
+                      (audit_trace_id,),
+                  ).fetchall()
+                  error_rows = conn.execute(
+                      """
+                      SELECT error_type, COALESCE(stack_trace, '')
+                      FROM app.ai_error_log
+                      WHERE trace_id = %s
+                      ORDER BY created_at
+                      """,
+                      (audit_trace_id,),
+                  ).fetchall()
+
+          memory_path = os.environ.get("AI_MEMORY_PATH")
+          memory_state = {
+              "enabled": bool(memory_path),
+              "path_exists": bool(memory_path and os.path.exists(memory_path)),
+              "size_bytes": (
+                  os.path.getsize(memory_path)
+                  if memory_path and os.path.isfile(memory_path)
+                  else None
+              ),
+          }
+          proc_state = None
+          proc_wchan = None
+          try:
+              proc_state = open(f"/proc/{ai_pid}/stat", encoding="utf-8").read().split(") ", 1)[1][0]
+              proc_wchan = open(f"/proc/{ai_pid}/wchan", encoding="utf-8").read().strip() or None
+          except OSError:
+              pass
+          stack_text = "\n".join(row[1] for row in error_rows)
+          print(json.dumps({
+              "job": {
+                  "job_id": job_id,
+                  "status": job[0],
+                  "polling_stage": job[1],
+                  "result_status": job[3],
+                  "failure": {
+                      "category": job[4], "subcause": job[5],
+                      "stage": job[6], "owner": job[7], "retryable": job[8],
+                  },
+                  "created_at": job[9].isoformat(),
+                  "updated_at": job[10].isoformat(),
+              },
+              "runtime": {
+                  "service_process_present": os.path.isdir(f"/proc/{ai_pid}"),
+                  "process_state": proc_state,
+                  "process_wait_channel": proc_wchan,
+                  "analysis_memory": memory_state,
+              },
+              "dispatch": {
+                  "outbox": [
+                      {
+                          "status": row[0],
+                          "created_at": row[1].isoformat(),
+                          "claimed_at": row[2].isoformat() if row[2] else None,
+                          "delivered_at": row[3].isoformat() if row[3] else None,
+                      }
+                      for row in outbox_rows
+                  ],
+              },
+              "audit": {
+                  "trace_found": audit_trace_id is not None,
+                  "trace": (
+                      {
+                          "status": trace_row[0],
+                          "started_at": trace_row[1].isoformat(),
+                          "ended_at": trace_row[2].isoformat() if trace_row[2] else None,
+                      }
+                      if trace_row is not None else None
+                  ),
+                  "agent_executions": [
+                      {
+                          "name": row[0], "status": row[1],
+                          "started_at": row[2].isoformat() if row[2] else None,
+                          "ended_at": row[3].isoformat() if row[3] else None,
+                          "latency_ms": float(row[4]) if row[4] is not None else None,
+                          "running_seconds": row[5],
+                      }
+                      for row in agent_rows
+                  ],
+                  "model_calls": [
+                      {"task_type": row[0], "provider": row[1], "status": row[2],
+                       "web_search_used": row[3], "retry_count": row[4],
+                       # AOAI stores only a fixed, secret-free failure category here.
+                       "failure_summary": row[5], "count": row[6]}
+                      for row in model_rows
+                  ],
+                  "error_types": [row[0] for row in error_rows],
+                  "exception_markers": [marker for marker in markers if marker in stack_text],
+              },
+          }, ensure_ascii=False, sort_keys=True))
+          PY
+          REMOTE
+
+      - name: Verify public AI readiness
+        if: ${{ inputs.mode == 'live-audit' }}
+        run: |
+          ai_required_checks='durable_job_store,migration_revision,live_provider_configuration,ai_contract_version,rule_draft_signer,backtest_evaluation_cache'
+          curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            https://qt-agent.kro.kr/ai-api/readiness \
+            | node scripts/readiness-semantic-gate.mjs --label public-ai-readiness --checks "$ai_required_checks"
+
+      - name: Benchmark internal backtest on two CPU cores
+        if: ${{ inputs.mode == 'deployed-backtest' }}
+        run: |
+          ssh -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/id_ed25519" \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            bash -s -- "$SERVER_APP_DIR" "$AOAI_RUN_ROOT" <<'REMOTE'
+          set -Eeuo pipefail
+
+          APP_DIR="$1"
+          RUN_ROOT="$2"
+          ARCHIVE="$RUN_ROOT.tgz"
+          case "$RUN_ROOT" in
+            /tmp/quant-agent-aoai-[0-9]*) ;;
+            *) printf 'Unsafe benchmark path: %s\n' "$RUN_ROOT" >&2; exit 2 ;;
+          esac
+          trap 'rm -rf -- "$RUN_ROOT"; rm -f -- "$ARCHIVE"' EXIT
+          rm -rf -- "$RUN_ROOT"
+          mkdir -p "$RUN_ROOT"
+          tar -xzf "$ARCHIVE" -C "$RUN_ROOT"
+
+          if [ -f "$HOME/.bashrc" ]; then
+            set +u
+            source "$HOME/.bashrc"
+            set -u
+          fi
+
+          test -x "$APP_DIR/ai/.venv/bin/python"
+          test -f "$RUN_ROOT/ai/scripts/benchmark_backtest_optimization.py"
+          command -v taskset >/dev/null
+
+          cd "$RUN_ROOT/ai"
+          export AI_LLM_PROVIDER=mock
+          export OMP_NUM_THREADS=1
+          export OPENBLAS_NUM_THREADS=1
+          export MKL_NUM_THREADS=1
+          export NUMEXPR_NUM_THREADS=1
+          RESULTS_FILE="$RUN_ROOT/results.jsonl"
+          for _ in 1 2 3; do
+            PYTHONPATH="$RUN_ROOT/ai:$RUN_ROOT/backtest_module" \
+              taskset --cpu-list 0,1 "$APP_DIR/ai/.venv/bin/python" -u \
+                "$RUN_ROOT/ai/scripts/benchmark_backtest_optimization.py" \
+                --tickers 203 --days 2520 --workers 2 --candidates 3 \
+              | tee -a "$RESULTS_FILE"
+          done
+          "$APP_DIR/ai/.venv/bin/python" - "$RESULTS_FILE" <<'PY'
+          import json
+          from pathlib import Path
+          from statistics import median
+          import sys
+
+          results = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+          hashes = {result["canonical_sha256"] for result in results}
+          walls = [float(result["wall_seconds"]) for result in results]
+          for result in results:
+              selection, full = result["execution_stats"]["rounds"][:2]
+              if len(selection["action_worker_pids"]) != 2:
+                  raise RuntimeError("structured actions did not use both workers")
+              if full["action_cache_hits"] != 1 or full["action_build_seconds"] != 0.0:
+                  raise RuntimeError("selected actions were rebuilt for full evaluation")
+          wall_median = median(walls)
+          if len(hashes) != 1:
+              raise RuntimeError("parallel benchmark result was not deterministic")
+          if wall_median > 40.0:
+              raise RuntimeError(f"two-core median {wall_median:.6f}s exceeded 40s")
+          print(json.dumps({
+              "canonical_sha256": next(iter(hashes)),
+              "median_wall_seconds": wall_median,
+              "runs": walls,
+              "status": "pass",
+          }, sort_keys=True))
+          PY
+          REMOTE

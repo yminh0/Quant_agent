@@ -1,0 +1,130 @@
+# QuantAgent FE HI-FI 구현
+
+Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScript + Vite 프론트엔드입니다.
+
+## 구현 route
+
+| Route | 기준 Figma frame |
+|---|---|
+| `/` | `HI-FI · 07 — / 랜딩` |
+| `/app` | `HI-FI · 08 — /app · 전체 탭`, `HI-FI · 09 — /app · 매매종목 정보 탭`, `HI-FI · 10 — /app · 수익률 탭` |
+| `/app/strategies/new` | 전략 생성 폼 |
+| `/app/strategies/:id/edit` | 전략 수정 폼 |
+| `/login` | Google 로그인 시작 |
+| `/auth/google/callback` | Google OAuth callback 처리 |
+| `/me`, `/me/notifications` | 마이페이지, 리포트 알림 설정 |
+| `/reports` | `HI-FI · 14 — /reports 리포트 목록` |
+| `/reports/:id` | `HI-FI · 11 — /reports/:id 리포트 상세` |
+| `/search` | 전략·종목·리포트 통합 검색 |
+| `/terms`, `/privacy`, `/disclaimer`, `/unsubscribe` | 정책, 면책, 수신 거부 |
+
+## Rocky Linux Native 실행 전제 조건
+
+- Rocky Linux 8.10 x86_64
+- Native Bash
+- Python 3.11.13 (pytest/스크립트 동기화)
+- Node 24.15.0
+- npm 11.12.1
+- 로컬 회귀 검사는 외부 DB/Redis/OAuth/컨테이너 없이 실행 가능
+- 실데이터 검증은 AI 서버에 PostgreSQL DSN과 AOAI Responses 설정 필요
+
+## 환경변수
+
+| Name | Purpose |
+|---|---|
+| `VITE_AI_API_BASE_URL` | production 빌드에서만 적용되는 AI API base URL (`/ai-api`는 dev에서 고정)
+| `VITE_AUTH_API_BASE_URL` | Google OAuth 시작/콜백/로그아웃 API base URL |
+| `VITE_REPORT_ACTION_API_BASE_URL` | 리포트 이메일 재발송 API base URL |
+| `VITE_STRATEGY_API_BASE_URL` | 전략 저장/분석 실행 API base URL |
+
+## FE 설치
+
+```bash
+npm --prefix fe ci
+```
+
+## 실행
+
+`npm run dev` 대신 아래 canonical 명령으로 FE를 직접 기동한다. direct Node/Vite를 leader로 쓰고, `npm` 래퍼 프로세스를 리더로 두지 않는다.
+
+```bash
+WORKTREE_ROOT=$(readlink -f "$(git rev-parse --show-toplevel)")
+NODE_BIN=$(readlink -f "$(command -v node)")
+VITE_ENTRY=$(readlink -f "$WORKTREE_ROOT/fe/node_modules/.bin/vite")
+FE_ROOT=$(readlink -f "$WORKTREE_ROOT/fe")
+[[ $FE_ROOT == "$WORKTREE_ROOT/fe" && $FE_ROOT == "$WORKTREE_ROOT/"* ]]
+[[ -f "$FE_ROOT/index.html" && -f "$FE_ROOT/vite.config.ts" ]]
+"$NODE_BIN" "$VITE_ENTRY" "$FE_ROOT" --host 127.0.0.1
+```
+
+- `fe/vite.config.ts`의 `server.proxy['/ai-api']`는 `http://127.0.0.1:18001`로 전달한다.
+- SSH 포워딩은 `18000` 포트만 허용한다 (`-L 18000:127.0.0.1:18000`).
+- 동일 브라우저 세션을 유지한다. QA 중 page reload/restart는 수행하지 않는다.
+
+## 시작 fixture (동일 브라우저 세션, 세 개 키만 사용)
+
+```javascript
+const keys=["quantagent.auth.session.v1","quantagent.latest-analysis-job.v1","quantagent.chat-conversations.v1"];
+keys.forEach((key)=>localStorage.removeItem(key));
+console.assert(keys.every((key)=>localStorage.getItem(key)===null));
+localStorage.setItem("quantagent.auth.session.v1",JSON.stringify({user:{id:"local-mvp-fixture",name:"Local MVP Fixture",email:"local-mvp@example.invalid",provider:"test"}}));
+location.assign("/app");
+```
+
+## 종료 evidence (same-session 기준)
+
+```javascript
+const keys=["quantagent.auth.session.v1","quantagent.latest-analysis-job.v1","quantagent.chat-conversations.v1"];
+keys.forEach((key)=>localStorage.removeItem(key));
+const evidence={origin:location.origin,values:keys.map((key)=>localStorage.getItem(key))};
+console.log(JSON.stringify(evidence));
+console.assert(evidence.origin==="http://127.0.0.1:18000"&&evidence.values.every((value)=>value===null));
+```
+
+## Human QA 범위
+
+- **ready**:
+  - Overview의 `result.strategy_spec.name`
+  - Performance 탭의 `result.user_payload.performance.selected_candidate_id`와 metrics
+  - recent report detail의 `web_projection.title`, summary→conclusion, `sections[*].title`
+- **표시 증거에서 제외**: `sections[*].items`, email projection, 종목별 근거 계약이 없는 recipient/candidates/signal axes
+- **clarification**: clarification 상태 메시지와 정확히 `3`개 candidate card만 확인한다. question/options UI는 요구하지 않는다.
+- **AI-down**: FE 자체는 200을 유지하고 새 분석 요청은 오류 UI를 표시하며 새 ready 결과를 만들지 않아야 한다.
+- Google OAuth 성공, page reload, AI process restart 뒤 복원은 이 MVP 범위 밖이다.
+
+## 데이터/API 경계
+`src/api/quantAgentClient.ts`는 `appConfig.aiApiBaseUrl`를 사용한다. `import.meta.env.DEV`에서는 항상 `/ai-api`로 고정되고, production 빌드에서만 `VITE_AI_API_BASE_URL`이 적용된다.
+- **정적 샘플**: 랜딩 페이지의 제품 소개용 `landingSample`만 정적 콘텐츠다. 제품 워크스페이스나 리포트 데이터로 사용하지 않는다.
+- **실제 API**: `createAnalysisJob`/`getAnalysisJob`는 `/analysis-jobs`를 호출하고, 워크스페이스·성과·리포트·전략 목록은 최신 실제 job 응답에서만 만든다.
+- **빈 상태**: 분석 전 workspace template, 실제 발송 API가 없는 이메일 이력, 실제 history API가 없는 과거 리포트는 빈 상태를 표시한다.
+- **로컬 캐시**: 최신 실제 job 한 건을 `localStorage`에 보관하고 서버 조회가 일시 실패하면 마지막 실제 응답을 표시한다. 이전 `ai-job:<job_id>` 리포트는 서버의 job 조회 API로 다시 가져오며 fixture 결과로 대체하지 않는다.
+- **사용자 격리**: 보호 route 진입 전에 backend `/auth/me`로 Redis session을 검증한다. 로그아웃·사용자 변경 시 분석/대화/알림 캐시를 함께 삭제하고, job 조회의 `401`/`403`/`404`는 캐시 fallback 없이 오류로 처리한다.
+- **동기 요청 한계**: 현재 서버가 graph를 동기 실행하므로 FE는 기본 AOAI timeout/retry의 순차 호출 예산에 맞춰 분석 요청을 최대 20분 기다린다. 비동기 queue 전환은 별도 아키텍처 작업이다.
+
+최신 AI job에 없는 종목 후보, 신호 축, 수신자, 매크로 이벤트는 채워 넣지 않고 화면에 미제공 상태를 표시한다. 랜딩의 샘플 CTA는 mock 리포트 상세 route가 아니라 실제 분석 시작 화면으로 연결된다.
+`/analysis-jobs` 응답은 화면 contract상 노출 대상인 `status`, `trace_id`, `schema_version`, `strategy_spec`, `debug_ref`, `retryable`, `user_payload`만 유지한다. `internal_payload`는 화면 노출하지 않는다.
+
+## 검증
+
+```bash
+npm run test
+```
+
+`npm run test`는 Node 기본 회귀 검사, `tsc -b --pretty false`, `vite build`를 순차 실행합니다.
+
+## 2026-09-02 E2E 검증 메모
+
+- `/app`는 분석이 `ready`가 되면 `POST /api/v1/runs` → `/runs/{id}/complete`로 서비스 DB에 결과를 저장하고, 이 완료가 리포트 이메일 enqueue 지점이다.
+  production에서 두 route가 410이던 문제는 백엔드에서 해제됐다. FE는 혹시 다시 410 `public_create_retired`가 오면 재시도·배너 없이 종료한다.
+- `/me`의 이메일 이력 타임라인에 `다시 보내기` 버튼이 생겼다(`POST /api/v1/reports/{id}/resend`, 202=재큐잉, 204=이미 대기 중, 409=발송 불가).
+- 자연어 입력은 2000자로 제한된다(서버 `CreateAnalysisJobRequest.query`와 동일).
+- `/dev/email-template` 개발용 라우트와 `EmailTemplatePreviewPage`는 제품 번들에서 제거됐다(퇴역 목록 OD-07).
+  `DailyDigestEmail.tsx`/mock은 `scripts/generate-daily-digest-email.mjs`가 쓰므로 남겨 두었다.
+- `scripts/production-gateway.mjs`의 upstream timeout을 15초 → 65초로 올렸다. AI SSE keepalive가 15초 간격이라 스트림이 끊길 수 있었다.
+- 백엔드 hosted-pages 정책에서 `trust`를 뺐다. FE에 `/trust` 화면이 없어 404 정책과 라우트 표가 어긋나 있었다.
+
+## Overview 지표 표시 규칙 (2026-09-03)
+
+- **OOS 타일 vs 후보 카드**: `/app` Overview의 추천 타일과 차트 카드는 워크포워드 out-of-sample 지표(`out_sample_*`)를 읽는다 — "검증 구간(OOS) 누적 수익률", "Sharpe (Walk-forward OOS)"로 라벨링한다. Performance 탭의 후보별 카드는 선택된 후보의 전체 구간(탐색에 쓰인 기간 포함) 숫자를 그대로 유지하고 "선택 후보 전체 구간 기준" 캡션을 붙인다(`src/features/app/PerformanceTab.tsx`). 이름이 비슷해도 두 화면이 다른 숫자를 보여줄 수 있고, 그건 버그가 아니다.
+- **"보류"**: `recommendation_gate.validated`가 아니면 추천 점수는 "10.0 / 10" 같은 등급 대신 항상 "보류"로 표시한다(`src/api/quantAgentClient.ts`의 `RECOMMENDATION_SCORE_HOLD_LABEL`). 추천 타일, 최근 리포트 카드, 리포트 목록이 같은 상수를 공유해 컴포넌트 사이에 규칙이 어긋나지 않는다.
+- **차트 포인트 상한**: equity curve는 최근 250포인트(`CHART_POINT_LIMIT`, `src/features/app/OverviewTab.tsx`)까지 그린다 — 예전에 마지막 5포인트로 자르던 것과 달리 이제는 비정상적으로 긴 곡선만 자른다.

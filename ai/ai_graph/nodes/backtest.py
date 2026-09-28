@@ -1,0 +1,5373 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import pickle
+import sys
+import time
+from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from dataclasses import dataclass, field
+from datetime import date
+from hashlib import sha256
+from multiprocessing import get_all_start_methods, get_context
+from pathlib import Path
+from tempfile import gettempdir
+from threading import Lock
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from ai_graph.nodes.backtest_code import generate_self_improvement_candidates
+from ai_graph.nodes.backtest_features import (
+    FEATURE_DEFINITION_VERSION,
+    PreparedFeatureStore,
+    rule_metric_coverage,
+)
+from ai_graph.nodes.position_sizing import (
+    available_ticker_count as _shared_available_ticker_count,
+)
+from ai_graph.nodes.position_sizing import (
+    required_max_position_pct,
+)
+from ai_graph.progress import (
+    AnalysisCancelled,
+    deadline_remaining_seconds,
+    raise_if_cancelled,
+    raise_if_past_deadline,
+    report_activity,
+)
+from ai_graph.quant_strategy import AUTOMATIC_TOURNAMENT_PROFILES
+from ai_graph.research_campaign import (
+    DEFAULT_RESEARCH_CAMPAIGN_MAX_ROUNDS,
+    ResearchCampaign,
+)
+from ai_graph.research_eligibility import MISSING_EXECUTION_ASSUMPTION
+from ai_graph.schemas import (
+    BacktestEquityPoint,
+    BacktestMetrics,
+    CandidateBacktestResult,
+    CodeCandidate,
+    WalkForwardFoldSelection,
+    WalkForwardPolicyResult,
+)
+from ai_graph.schemas import StrategySpec as AIStrategySpec
+from ai_graph.security.ast_validator import validate_backtest_code
+from ai_graph.source_manifest import is_release_profile
+from ai_graph.validation_gates import objective_floor_is_enforced, validation_gate_mode
+
+_logger = logging.getLogger(__name__)
+
+BACKTEST_MODULE_SOURCE_ROOT = Path(__file__).resolve().parents[3] / "backtest_module"
+DEFAULT_FIXTURE_TICKER = "005930"
+DEFAULT_FIXTURE_MARKET = "KRX"
+DEFAULT_FIXTURE_VOLUME = 1_000_000.0
+DEFAULT_INITIAL_CAPITAL = 1_000_000.0
+CANONICAL_ANALYSIS_INITIAL_CAPITAL = 100_000_000.0
+METRIC_ROUND_DIGITS = 6
+MIN_RETURNS_FOR_SPLIT = 4
+PRIMARY_BENCHMARK_LABEL = "공식 KOSPI/KOSDAQ TR"
+PRIMARY_BENCHMARK_METHOD = "official_kospi_kosdaq_total_return"
+# Named so a reader can never mistake it for the market. It is the same PIT universe
+# the strategy trades, held equal-weight - beating it is not beating KOSPI/KOSDAQ.
+AUXILIARY_BENCHMARK_LABEL = "유니버스 동일가중 프록시 — 공식 지수 아님"
+# Appended to every acceptance reason that was judged against the proxy, so the
+# verdict never reads as an official index comparison.
+PROXY_BENCHMARK_JUDGEMENT_SUFFIX = f"({AUXILIARY_BENCHMARK_LABEL} 기준)"
+AUXILIARY_BENCHMARK_METHOD = "fixed_universe_equal_weight_buy_and_hold"
+AUXILIARY_BENCHMARK_WARNING = (
+    "공식 KOSPI/KOSDAQ 총수익률(TR) 시계열과 월초 목표 비중이 입력되지 않아 "
+    "동일가중 보조 프록시만 계산했습니다. 공식 벤치마크로 해석할 수 없습니다."
+)
+PRIMARY_BENCHMARK_MISSING_INPUT_REASON = (
+    "official KOSPI and KOSDAQ total-return series with target weights were not supplied"
+)
+PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON = "official_benchmark_source_unavailable"
+OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE = 0.99
+# Legacy graph exports now describe the authoritative primary benchmark contract.
+BENCHMARK_LABEL = PRIMARY_BENCHMARK_LABEL
+BENCHMARK_METHOD = PRIMARY_BENCHMARK_METHOD
+BENCHMARK_WARNING = AUXILIARY_BENCHMARK_WARNING
+# Candidates are selected using only the first 70% of the history. The final 30%
+# is a hold-out, not a rolling walk-forward validation.
+BACKTEST_SPLIT_FRACTION = 0.7
+# The five-year contract. These stay exported at their original values because the
+# sealed V2 exploration policy is validated against them in `graph.run_analysis`; the
+# geometry a run actually uses comes from `walk_forward_policy_for`, which scales it to
+# how much history was loaded (see AI_BACKTEST_LOOKBACK_YEARS).
+WALK_FORWARD_WARMUP_MONTHS = 1
+WALK_FORWARD_TRAIN_MONTHS = 12
+WALK_FORWARD_VALIDATION_MONTHS = 3
+WALK_FORWARD_EVALUATION_MONTHS = 1
+WALK_FORWARD_ROLL_MONTHS = 1
+WALK_FORWARD_MIN_VALID_FOLDS = 24
+WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS = 24
+WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS = 480
+# Window tier boundaries, in distinct months present in the price rows. A one-year
+# window cannot fill a single 17-month fold, so the fixed geometry above produces zero
+# folds there and a three-year window produces folds but never enough of them - both
+# mask every out-of-sample metric. Below 41 months the geometry and its minimums scale
+# to what the window can actually supply.
+WALK_FORWARD_SHORT_WINDOW_MAX_MONTHS = 15
+WALK_FORWARD_FULL_WINDOW_MIN_MONTHS = 41
+# Kept as an internal spelling for callers that imported the old constant.
+WALK_FORWARD_MIN_SESSIONS = WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS
+INSUFFICIENT_WALK_FORWARD_SAMPLE = "INSUFFICIENT_WALK_FORWARD_SAMPLE"
+READY_WALK_FORWARD = "READY_WALK_FORWARD"
+UNSAFE_WALK_FORWARD_CANDIDATE = "UNSAFE_WALK_FORWARD_CANDIDATE"
+# Walk-forward selects inside every fold, so there is no one in-sample block to compare
+# the hold-out against. The aggregate pins both at 0.0 to keep the deflation arithmetic
+# well defined; publishing that 0.0 as a measurement would claim zero overfitting decay.
+WALK_FORWARD_HAS_NO_IN_SAMPLE_BLOCK = "walk_forward_has_no_single_in_sample_block"
+# A win rate is a statistic over closed round trips. With none closed there is nothing to
+# average, and "0%" would read as "every trade lost".
+NO_CLOSED_TRADE_WIN_RATE = "no_closed_trade_in_evaluation_window"
+# A rule can only fire on sessions where the metrics it compares actually have a value.
+# Below this share the result mostly measures the gap in the data, so it is disclosed.
+MIN_DISCLOSED_METRIC_COVERAGE = 0.50
+# A quarter is short enough to expose regime-specific wins/losses instead of letting a
+# ten-year total hide them. A strategy may win by a lot in some blocks, but losing at
+# least half of these fixed, non-overlapping blocks is still an automatic failure.
+BENCHMARK_EVALUATION_PERIOD_DAYS = 63
+MAX_AUTOMATIC_BENCHMARK_LOSS_RATE = 0.50
+PUBLIC_EQUITY_CURVE_POINTS = 12
+MIN_OBJECTIVE_TRADES = 5
+# Below this many matched names, a backtest describes the names, not the strategy, and
+# tuning dozens of rule variants against them is fitting noise. Warn rather than pretend.
+MIN_RELIABLE_TICKERS = 5
+# Performance thresholds remain selection policy only; data reliability is reported
+# independently through coverage and walk-forward metadata.
+MIN_OBJECTIVE_SHARPE = 0.0
+MAX_OBJECTIVE_DRAWDOWN = -0.50
+# The winner's in-sample Sharpe, less what an argmax over the same number of skill-free
+# candidates would be expected to reach. Zero is the honest floor: below it the result is
+# not distinguishable from having tried N things and kept the luckiest one.
+MIN_SELECTION_ADJUSTED_SHARPE = 0.0
+# Fallbacks for the engine's cost model, used only when a summary does not carry one.
+# They mirror backtest_module.models.CostModel's defaults.
+DEFAULT_COMMISSION_PCT = 0.00015
+DEFAULT_TAX_PCT = 0.0023
+DEFAULT_SLIPPAGE_PCT = 0.001
+DEFAULT_MAX_POSITIONS_FOR_COST = 10
+# Calibrated so the penalty keeps its old magnitude at the turnover candidates actually
+# run (measured: 47 trades a year over 10 slots, which is 2.2% of equity in costs, and
+# the old saturated penalty was 0.08). What changes is that it no longer has a ceiling,
+# so 86 trades a year now scores worse than 24 instead of identically.
+TURNOVER_PENALTY_WEIGHT = 3.7
+# A candidate trading more than this is not selectable. Same knee the old penalty used,
+# kept unchanged so the ceiling is not a number fitted to the experiment that validated
+# it. See _within_turnover_cap for the measurement.
+MAX_SELECTABLE_ANNUAL_TURNOVER = 24.0
+GENERATED_SIGNAL_METRIC = "generated_signal"
+BUY_SIGNAL_VALUE = 1.0
+SELL_SIGNAL_VALUE = -1.0
+HOLD_SIGNAL_VALUE = 0.0
+EXECUTION_AUDIT_TAIL_LIMIT = 20
+AI_BACKTEST_WORKERS_ENV = "AI_BACKTEST_WORKERS"
+DEFAULT_BACKTEST_WORKERS = 2
+AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV = "AI_BACKTEST_ALLOW_SPAWN_PARALLEL"
+AI_BACKTEST_CANDIDATE_TIMEOUT_ENV = "AI_BACKTEST_CANDIDATE_TIMEOUT_SECONDS"
+# Measured on the one-year default input (200 tickers x ~250 sessions, 48k rows): a
+# candidate costs ~1.7s on a 2x-slower Windows box, so eight seconds is a hang detector,
+# not a work budget. Both are env-overridable for the opt-in three-year window, whose
+# rolling evaluation is several times more expensive.
+DEFAULT_CANDIDATE_TIMEOUT_SECONDS = 8.0
+AI_BACKTEST_WALL_BUDGET_ENV = "AI_BACKTEST_WALL_BUDGET_SECONDS"
+# The whole analysis has a 60s product limit. Measured on the deployed site: research
+# 11-18s, code generation 2-9s, debate/report ~11s, leaving this node ~25s. At 30 two
+# self-improvement rounds fit and ready runs landed at 61-78s; at 22 the node stays at or
+# under ~25s and at most one round starts when its projected cost fits.
+DEFAULT_WALL_BUDGET_SECONDS = 22.0
+# Compatibility spelling for integrations that import the old constant. The actual
+# bound is now owned by ``ResearchCampaign`` so candidate, duplicate and no-progress
+# limits are enforced together rather than by a round count alone.
+MAX_SELF_IMPROVEMENT_ROUNDS = DEFAULT_RESEARCH_CAMPAIGN_MAX_ROUNDS
+SELF_IMPROVEMENT_CANDIDATES_PER_ROUND = 6
+SERIAL_EVALUATION_WORK_ITEMS = 250_000
+# v4: the action generator changed meaning - folds restart the book at their first
+# tradable session on a global rotation grid, engine stop/target exits are mirrored into
+# the book, and rotation slots backfill off-grid. The disk cache keys on these version
+# strings only, so an evaluator change that leaves them alone silently replays results
+# the old evaluator produced (measured: same key, 262 vs 1,106 buy signals).
+BACKTEST_ENGINE_VERSION = "candidate-engine.v4"
+# v6 adds the source-notional capacity claim to persisted summaries. Cached v5
+# evaluations predate that claim and could otherwise be reused as if capacity had
+# been checked (or not checked) under the new contract.
+# v7: persisted summaries now carry the fill-based win rate, positive_day_rate and the
+# rule metric coverage; v6 entries predate all three.
+BACKTEST_CACHE_SCHEMA_VERSION = "candidate-cache.v7"
+BACKTEST_CACHE_DIR_ENV = "AI_BACKTEST_CACHE_DIR"
+BACKTEST_CACHE_TTL_ENV = "AI_BACKTEST_CACHE_TTL_SECONDS"
+BACKTEST_CACHE_MAX_BYTES_ENV = "AI_BACKTEST_CACHE_MAX_BYTES"
+DEFAULT_CACHE_TTL_SECONDS = 86_400
+DEFAULT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+# How many stores between disk sweeps. Cleanup no longer runs on construction, so a
+# fresh session never scans the whole cache dir; the sweep is amortized across writes.
+# ponytail: write-count amortization, switch to a byte counter if TTL eviction must be prompt.
+CACHE_CLEANUP_WRITE_INTERVAL = 64
+PRICE_FIELD_NAMES = frozenset(
+    {
+        "date",
+        "ticker",
+        "name",
+        "market",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "raw_open",
+        "raw_high",
+        "raw_low",
+        "raw_close",
+        "raw_volume",
+        "raw_notional",
+    }
+)
+ALLOWED_RUNTIME_IMPORTS = frozenset({"datetime", "math", "statistics"})
+DEFAULT_BACKTEST_PRICE_ROWS: tuple[dict[str, object], ...] = (
+    {
+        "date": "2026-01-02",
+        "ticker": DEFAULT_FIXTURE_TICKER,
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.0,
+        "volume": DEFAULT_FIXTURE_VOLUME,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 100.0,
+        "rsi": 25.0,
+    },
+    {
+        "date": "2026-01-03",
+        "ticker": DEFAULT_FIXTURE_TICKER,
+        "open": 102.0,
+        "high": 103.0,
+        "low": 101.0,
+        "close": 102.0,
+        "volume": DEFAULT_FIXTURE_VOLUME * 1.6,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 1.6 * 102.0,
+        "rsi": 50.0,
+    },
+    {
+        "date": "2026-01-04",
+        "ticker": DEFAULT_FIXTURE_TICKER,
+        "open": 101.0,
+        "high": 102.0,
+        "low": 100.0,
+        "close": 101.0,
+        "volume": DEFAULT_FIXTURE_VOLUME,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 101.0,
+        "rsi": 75.0,
+    },
+    {
+        "date": "2026-01-05",
+        "ticker": DEFAULT_FIXTURE_TICKER,
+        "open": 105.0,
+        "high": 106.0,
+        "low": 104.0,
+        "close": 105.0,
+        "volume": DEFAULT_FIXTURE_VOLUME,
+        "raw_notional": DEFAULT_FIXTURE_VOLUME * 105.0,
+        "rsi": 50.0,
+    },
+)
+SIGNAL_METRIC_VALUES = {
+    "BUY": BUY_SIGNAL_VALUE,
+    "SELL": SELL_SIGNAL_VALUE,
+    "HOLD": HOLD_SIGNAL_VALUE,
+}
+
+VERBOSE_ENGINE_SUMMARY_KEYS = frozenset(
+    {
+        "metrics",
+        "monthly_returns",
+        "drawdown_details",
+        "drawdown_series",
+        "rolling_volatility",
+        "rolling_sharpe",
+        "rolling_sortino",
+        "rolling_greeks",
+        "montecarlo",
+        "montecarlo_mean",
+        "montecarlo_cagr",
+        "montecarlo_drawdown",
+        "montecarlo_sharpe",
+        "outliers",
+        "excluded_tickers",
+        "excluded_ticker_jsonb",
+        "indicator_report",
+        "indicator_report_jsonb",
+        "_storage_execution_ledger",
+    }
+)
+
+
+def _public_engine_summary(engine_summary: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in engine_summary.items()
+        if key not in VERBOSE_ENGINE_SUMMARY_KEYS
+    }
+
+
+def _performance_method_manifest(
+    strategy: AIStrategySpec,
+    candidate: CodeCandidate,
+    rows: Sequence[Mapping[str, Any]],
+    engine_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Emit the provenance required before a run's values become public.
+
+    This intentionally uses facts generated by the engine invocation (input dates,
+    actual summary, selected candidate and configured costs), not an API caller's
+    labels.  The projection validates this record independently and publishes no
+    performance object when it is incomplete.
+    """
+
+    dates = sorted({str(row.get("date")) for row in rows if row.get("date") is not None})
+    tickers = sorted({str(row.get("ticker")) for row in rows if row.get("ticker") is not None})
+    parameters = candidate.parameters
+    cost_model = engine_summary.get("cost_model")
+    costs = cost_model if isinstance(cost_model, Mapping) else {}
+    capacity = engine_summary.get("execution_capacity")
+    capacity_enabled = bool(capacity.get("enabled")) if isinstance(capacity, Mapping) else False
+    capacity_reason = (
+        str(capacity.get("reason_code"))
+        if isinstance(capacity, Mapping) and capacity.get("reason_code")
+        else None
+    )
+    capacity_clause = (
+        "execution_capacity=source_raw_notional_validated"
+        if capacity_enabled
+        else "execution_capacity=not_evaluated"
+        + (f"({capacity_reason})" if capacity_reason else "(source_raw_notional_not_recorded)")
+    )
+    cost_liquidity = "cost_model=" + json.dumps(costs, sort_keys=True, separators=(",", ":"))
+    if costs:
+        cost_liquidity += "; " + capacity_clause
+    candidate_rule = (
+        str(parameters.blueprint_id or parameters.profile)
+        if parameters is not None
+        else candidate.candidate_id
+    )
+    substituted = not _is_user_rule(candidate)
+    summary_identity = {
+        "candidate_id": candidate.candidate_id,
+        "dates": dates,
+        "trade_count": engine_summary.get("effective_trade_count"),
+        "initial_capital": engine_summary.get("initial_capital"),
+        "execution_capacity": capacity,
+    }
+    return {
+        "evaluated_rule": candidate_rule,
+        "rule_version": (
+            str(parameters.blueprint_id)
+            if parameters is not None and parameters.blueprint_id
+            else FEATURE_DEFINITION_VERSION
+        ),
+        "substituted": substituted,
+        "market": strategy.market,
+        "universe": f"engine_input_tickers:{len(tickers)}",
+        "start_date": dates[0] if dates else "unavailable",
+        "end_date": dates[-1] if dates else "unavailable",
+        "eod_basis": "input_ohlcv_eod_dates",
+        "initial_capital": float(engine_summary.get("initial_capital") or 0.0),
+        # A cadence is only claimed when the rule actually rebalances on a schedule;
+        # an event-driven rule trades when its conditions fire, and reporting a
+        # 21-day cadence for it described a strategy that was never run.
+        "rebalance_timing": (
+            f"every_{parameters.rebalance_interval_days}_trading_days"
+            if parameters is not None and _rebalances_on_a_schedule(candidate)
+            else "signal_driven"
+            if parameters is not None
+            else "engine_default"
+        ),
+        "holding_period": (
+            f"{candidate.strategy_ir.holding_days}_trading_days"
+            if candidate.strategy_ir is not None and candidate.strategy_ir.holding_days
+            else "rule_exit_only"
+        ),
+        "fill_timing": str(engine_summary.get("execution_timing") or MISSING_EXECUTION_ASSUMPTION),
+        "corporate_action_method": "engine_corporate_action_event_policy",
+        "cost_tax_slippage_liquidity": cost_liquidity,
+        "observations": len(dates),
+        "trades": max(0, int(_summary_float_default(engine_summary, "effective_trade_count", 0.0))),
+        "benchmark_method": "official_kospi_kosdaq_total_return_or_explicitly_unavailable",
+        "data_version": f"feature-definition:{FEATURE_DEFINITION_VERSION}",
+        "result_version": sha256(
+            json.dumps(summary_identity, sort_keys=True, separators=(",", ":"), default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+        "execution_version": "ai_graph_backtest_engine.v1",
+        "historical_simulation_warning": "Historical simulation is not a guarantee of future returns.",
+    }
+
+
+def _rebalances_on_a_schedule(candidate: CodeCandidate) -> bool:
+    """Whether this candidate's rule only re-selects on rotation dates."""
+
+    return (
+        candidate.strategy_ir is not None
+        and candidate.strategy_ir.execution_mode == "scheduled_rotation"
+    )
+
+
+def _is_user_rule(candidate: Any) -> bool:
+    """Whether this candidate trades the strategy's own compiled conditions."""
+
+    parameters = getattr(candidate, "parameters", None)
+    profile = getattr(parameters, "profile", None)
+    blueprint_id = getattr(parameters, "blueprint_id", None)
+    if profile is None and isinstance(parameters, Mapping):
+        profile = parameters.get("profile")
+        blueprint_id = parameters.get("blueprint_id")
+    return profile == "compiled_conditions" and not blueprint_id
+
+
+def rule_provenance(
+    backtest: Mapping[str, Any],
+    entry_conditions: Sequence[Mapping[str, Any]] | None,
+    *,
+    selection_mode: str | None = None,
+) -> dict[str, Any]:
+    """Which rule the backtest actually traded, stated by the backtest.
+
+    `compiled_conditions` means the user's concrete rule was traded. Profiles recorded
+    in the catalog blueprints are also intended rules when the user delegated selection.
+    Any other generic profile is a substitution that must remain visible. The legacy
+    three-profile menu is accepted only for older results without catalog metadata.
+    """
+
+    from ai_graph.nodes.condition_compiler import compile_conditions
+    from ai_graph.schemas import Condition
+
+    selected = backtest.get("selected_candidate") or {}
+    profile = ((selected.get("parameters") or {}).get("profile")) or "unknown"
+    blueprint_id = (selected.get("parameters") or {}).get("blueprint_id")
+    requested = [str(c.get("left")) for c in (entry_conditions or []) if c.get("left")]
+    catalog_profiles = {
+        str(item.get("profile"))
+        for item in (backtest.get("generated_strategy_blueprints") or [])
+        if isinstance(item, Mapping) and item.get("profile")
+    }
+    intended_automatic_profile = selection_mode == "automatic" and (
+        bool(blueprint_id)
+        or profile in catalog_profiles
+        or (not catalog_profiles and profile in AUTOMATIC_TOURNAMENT_PROFILES)
+    )
+    substituted = profile != "compiled_conditions" and not intended_automatic_profile
+
+    untranslatable: list[str] = []
+    if substituted and entry_conditions:
+        for raw in entry_conditions:
+            try:
+                one = Condition.model_validate(raw)
+            except Exception:
+                untranslatable.append(str(raw.get("left")))
+                continue
+            if compile_conditions([one]) is None:
+                untranslatable.append(one.left)
+
+    # Two very different substitutions were being reported as one. "Could not be
+    # translated" means the user's rule never ran. "Scored lower" means it ran and lost
+    # to a generic template on the objective function - the user's strategy was
+    # evaluated, and then something else was recommended in its place. Asserting the
+    # first when the second happened is the same presumed-cause error this record exists
+    # to remove.
+    ran_own_rule = any(
+        ((c.get("parameters") or {}).get("profile")) == "compiled_conditions"
+        and not ((c.get("parameters") or {}).get("blueprint_id"))
+        for c in (backtest.get("candidates") or [])
+    )
+    if not substituted:
+        reason = None
+    elif untranslatable:
+        reason = (
+            "생성된 조건 중 백테스트가 평가할 수 없는 항목이 있어 일반 템플릿으로 "
+            "대체했습니다: " + ", ".join(untranslatable)
+        )
+    elif ran_own_rule:
+        reason = (
+            "사용자 조건도 후보로 백테스트했지만 목적함수 점수가 더 낮아 "
+            "일반 템플릿이 선택됐습니다."
+        )
+    else:
+        reason = "사용자 조건이 백테스트 후보에 포함되지 않았습니다."
+    if intended_automatic_profile and blueprint_id:
+        evaluated_rule = f"automatic_blueprint:{blueprint_id}"
+    elif profile == "compiled_conditions":
+        evaluated_rule = "user_conditions"
+    elif intended_automatic_profile:
+        evaluated_rule = f"automatic_profile:{profile}"
+    else:
+        evaluated_rule = f"template:{profile}"
+    return {
+        "evaluated_rule": evaluated_rule,
+        "substituted": substituted,
+        "requested_conditions": requested,
+        "untranslatable_conditions": untranslatable,
+        "reason": reason,
+    }
+
+
+def summarize_backtest(backtest: Mapping[str, Any]) -> dict[str, Any]:
+    selected = backtest.get("selected_candidate") or {}
+    selected_id = selected.get("candidate_id")
+    engine_summary = backtest.get("engine_summary") or (
+        backtest.get("engine_summaries_by_candidate") or {}
+    ).get(selected_id, {})
+    return {
+        "selected_candidate_id": selected_id,
+        "metrics": selected.get("metrics") or {},
+        # Full metrics carry multi-year rolling series and 250 Monte Carlo paths. They
+        # made one report prompt 2.18 million characters and guaranteed an AOAI
+        # response-start timeout. The scalar summary plus selected public metrics are
+        # sufficient for interpretation; detailed arrays remain in debug artifacts.
+        "engine_summary": _public_engine_summary(engine_summary),
+        "objective_score": (backtest.get("objective_scores_by_candidate") or {}).get(selected_id),
+        "headline": _headline_metrics(selected.get("metrics") or {}),
+    }
+
+
+def _headline_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """The numbers a reader may treat as a forecast, taken from the hold-out only.
+
+    `sharpe_ratio`, `total_return` and `max_drawdown` span the whole period, of which the
+    first 70% is what selection optimised against. Presenting them as the result of the
+    backtest states an in-sample fit as though it were an out-of-sample finding. The
+    hold-out figures are the same run, restricted to the part no candidate was chosen on.
+
+    `basis` and `candidates_evaluated` travel with the numbers so the reader is never
+    left to assume which period they cover or how wide the search behind them was.
+    """
+
+    return {
+        "basis": "hold_out",
+        "hold_out_fraction": round(1.0 - BACKTEST_SPLIT_FRACTION, 4),
+        "total_return": metrics.get("out_sample_return"),
+        "sharpe_ratio": metrics.get("out_sample_sharpe"),
+        "max_drawdown": metrics.get("out_sample_max_drawdown"),
+        "candidates_evaluated": metrics.get("candidates_evaluated"),
+        "selection_adjusted_sharpe": metrics.get("selection_adjusted_sharpe"),
+        # Kept alongside, explicitly labelled, so the in-sample figures remain available
+        # without being the ones on the headline.
+        "in_sample": {
+            "total_return": metrics.get("in_sample_return"),
+            "sharpe_ratio": metrics.get("in_sample_sharpe"),
+            "max_drawdown": metrics.get("in_sample_max_drawdown"),
+        },
+        "full_period": {
+            "total_return": metrics.get("total_return"),
+            "sharpe_ratio": metrics.get("sharpe_ratio"),
+            "max_drawdown": metrics.get("max_drawdown"),
+        },
+    }
+
+
+def _ensure_backtest_module_source_path() -> None:
+    package_root = BACKTEST_MODULE_SOURCE_ROOT / "backtest_module"
+    if not package_root.is_dir():
+        return
+    source_path = str(BACKTEST_MODULE_SOURCE_ROOT)
+    while source_path in sys.path:
+        sys.path.remove(source_path)
+    sys.path.insert(0, source_path)
+
+
+try:
+    from backtest_module import (
+        Condition as EngineCondition,
+    )
+    from backtest_module import (
+        ConditionOperator as EngineConditionOperator,
+    )
+    from backtest_module import (
+        PositionSizing as EnginePositionSizing,
+    )
+    from backtest_module import (
+        RiskControls as EngineRiskControls,
+    )
+    from backtest_module import (
+        StrategySpec as EngineStrategySpec,
+    )
+    from backtest_module.backtest import (
+        BacktestRunConfig as EngineBacktestRunConfig,
+    )
+    from backtest_module.backtest import (
+        OhlcvBar as EngineOhlcvBar,
+    )
+    from backtest_module.backtest import (
+        PreparedMarketData as EnginePreparedMarketData,
+    )
+    from backtest_module.backtest import (
+        TalibIndicatorConfig as EngineTalibIndicatorConfig,
+    )
+    from backtest_module.backtest import (
+        prepare_market_data as prepare_engine_market_data,
+    )
+    from backtest_module.backtest import (
+        run_backtest as run_engine_backtest,
+    )
+    from backtest_module.performance import (
+        QUANTSTATS_REQUIRED_MESSAGE,
+        quantstats_sharpe_from_returns,
+        returns_from_equity_curve,
+    )
+except ImportError:
+    _ensure_backtest_module_source_path()
+    for module_name in list(sys.modules):
+        if module_name == "backtest_module" or module_name.startswith("backtest_module."):
+            sys.modules.pop(module_name, None)
+    from backtest_module import (
+        Condition as EngineCondition,
+    )
+    from backtest_module import (
+        ConditionOperator as EngineConditionOperator,
+    )
+    from backtest_module import (
+        PositionSizing as EnginePositionSizing,
+    )
+    from backtest_module import (
+        RiskControls as EngineRiskControls,
+    )
+    from backtest_module import (
+        StrategySpec as EngineStrategySpec,
+    )
+    from backtest_module.backtest import (
+        BacktestRunConfig as EngineBacktestRunConfig,
+    )
+    from backtest_module.backtest import (
+        OhlcvBar as EngineOhlcvBar,
+    )
+    from backtest_module.backtest import (
+        PreparedMarketData as EnginePreparedMarketData,
+    )
+    from backtest_module.backtest import (
+        TalibIndicatorConfig as EngineTalibIndicatorConfig,
+    )
+    from backtest_module.backtest import (
+        prepare_market_data as prepare_engine_market_data,
+    )
+    from backtest_module.backtest import (
+        run_backtest as run_engine_backtest,
+    )
+    from backtest_module.performance import (
+        QUANTSTATS_REQUIRED_MESSAGE,
+        quantstats_sharpe_from_returns,
+        returns_from_equity_curve,
+    )
+
+
+class GeneratedSignal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: str = Field(min_length=1)
+    ticker: str | None = None
+    action: str = Field(pattern="^(BUY|SELL|HOLD)$")
+    price: float = Field(gt=0.0)
+    # Optional entry strength for scarce same-session slots.  Missing scores preserve
+    # the engine's deterministic ticker-order fallback instead of inventing a rank.
+    score: float | None = None
+
+
+class IsolatedCandidateCodeError(RuntimeError):
+    """A legacy candidate could not finish in its isolated signal process."""
+
+
+@dataclass(frozen=True)
+class _BenchmarkPeriodStats:
+    count: int
+    win_rate: float
+    loss_rate: float
+
+
+@dataclass(frozen=True)
+class _CandidateEvaluation:
+    candidate: CodeCandidate
+    engine_summary: dict[str, Any] | None = None
+    equity_curve: list[BacktestEquityPoint] | None = None
+    objective_score: float | None = None
+    quantstats_dependency_error: bool = False
+    diagnostics: dict[str, Any] | None = None
+    ticker_actions: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _is_cacheable_evaluation(evaluation: _CandidateEvaluation) -> bool:
+    """Keep only complete, dependency-independent candidate results on disk.
+
+    A missing optional dependency is an observation about the process that created the
+    evaluation, not about the strategy, rows, or candidate fingerprint.  Persisting it
+    made a repaired environment keep raising the old ``quantstats`` failure through the
+    isolated Python-fallback path.  Incomplete/failed evaluations likewise cannot be a
+    deterministic reusable result.
+    """
+
+    return bool(
+        not evaluation.quantstats_dependency_error
+        and evaluation.candidate.validation_ok
+        and evaluation.candidate.metrics is not None
+        and evaluation.engine_summary is not None
+        and evaluation.equity_curve is not None
+        and evaluation.objective_score is not None
+    )
+
+
+@dataclass(frozen=True)
+class _CandidateTaskResult:
+    evaluation: _CandidateEvaluation
+    generated_actions: Sequence[int] | None
+    generated_scores: Sequence[float] | None
+    action_build_seconds: float
+    action_cache_hit: bool
+    worker_pid: int
+    feature_cached_lookbacks: tuple[int, ...]
+    feature_estimated_bytes: int
+
+
+@dataclass(frozen=True)
+class _FoldEngineTask:
+    """One candidate on one fold: either its selection pass or its evaluation pass.
+
+    Only session labels travel to the worker. The rows themselves are already there as
+    `_WORKER_PRICE_ROWS`, and shipping a fold's slice per task would cost more than the
+    engine run it feeds.
+    """
+
+    candidate: Mapping[str, Any]
+    engine_sessions: tuple[str, ...]
+    tradable_sessions: tuple[str, ...]
+    targets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _FoldEngineOutcome:
+    metrics: BacktestMetrics | None = None
+    returns: dict[str, float] | None = None
+    fills: tuple[dict[str, Any], ...] = ()
+    ledger: dict[str, Any] | None = None
+    # Round trips the engine actually closed inside this fold's evaluation month, as
+    # (net_pnl,). The aggregate win rate is a trade statistic and cannot be recovered
+    # from the order audit, which carries costs but no realized PnL.
+    closed_trade_pnl: tuple[float, ...] = ()
+
+
+class _FoldPrepCache:
+    """Engine rows and engine prep for the fold and pass currently being evaluated.
+
+    Every task in a batch is the same fold and the same pass, so one entry holds all the
+    reuse there is; a second would only pin another fold's prepared market, and this runs
+    two-up on a 2 vCPU node.
+
+    The feature store is deliberately *not* here: actions are built on the whole-window
+    store the session already owns, so `date_number` is the global session index. A
+    per-fold store restarted that count at the fold's own first bar, which drifted the
+    rotation calendar from fold to fold and left long-window derived metrics unwarmed.
+    """
+
+    def __init__(self) -> None:
+        self.key: tuple[str, ...] | None = None
+        self.engine_rows: list[Mapping[str, Any]] = []
+        self.prepared: EnginePreparedMarketData | None = None
+
+    def load(
+        self,
+        strategy: AIStrategySpec,
+        rows: Sequence[Mapping[str, Any]],
+        task: _FoldEngineTask,
+    ) -> None:
+        key = task.engine_sessions
+        if self.key == key:
+            return
+        self.clear()
+        self.engine_rows = _rows_for_sessions(rows, task.engine_sessions)
+        self.prepared = _fold_prepared_market(strategy, self.engine_rows)
+        self.key = key
+
+    def clear(self) -> None:
+        self.key = None
+        self.engine_rows = []
+        self.prepared = None
+
+
+@dataclass(frozen=True)
+class _BenchmarkContext:
+    daily_returns: tuple[float, ...]
+    selection_days: int
+    selection_return: float
+    total_return: float | None
+    primary_available: bool
+    primary_unavailable_reason: str | None
+    auxiliary_label: str
+    primary_coverage: Mapping[str, Any] | None = None
+    # The session each entry of ``daily_returns`` belongs to, so a caller holding a
+    # subset of the window (walk-forward evaluation sessions) can compound exactly
+    # those days. Same length and order as ``daily_returns``.
+    daily_return_sessions: tuple[str, ...] = ()
+    # The auxiliary proxy's return over the whole window. Used as the benchmark for
+    # the acceptance checks whenever the official TR series is absent.
+    auxiliary_return: float | None = None
+
+
+@dataclass(frozen=True)
+class _WalkForwardFold:
+    fold_index: int
+    warmup_sessions: tuple[str, ...]
+    train_sessions: tuple[str, ...]
+    validation_sessions: tuple[str, ...]
+    evaluation_sessions: tuple[str, ...]
+
+    @property
+    def evaluation_month(self) -> str:
+        return self.evaluation_sessions[0][:7]
+
+
+@dataclass(frozen=True)
+class WalkForwardPolicy:
+    """Fold geometry and acceptance minimums, scaled to the loaded history."""
+
+    tier: str
+    warmup_months: int
+    train_months: int
+    validation_months: int
+    evaluation_months: int
+    roll_months: int
+    min_valid_folds: int
+    min_unique_evaluation_months: int
+    min_unique_evaluation_sessions: int
+
+    @property
+    def label(self) -> str:
+        return (
+            f"warmup_{self.warmup_months}m_train_{self.train_months}m"
+            f"_validation_{self.validation_months}m"
+            f"_evaluation_{self.evaluation_months}m_roll_{self.roll_months}m"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"policy": self.label, **vars(self)}
+
+
+FIVE_YEAR_WALK_FORWARD_POLICY = WalkForwardPolicy(
+    tier="full_window",
+    warmup_months=WALK_FORWARD_WARMUP_MONTHS,
+    train_months=WALK_FORWARD_TRAIN_MONTHS,
+    validation_months=WALK_FORWARD_VALIDATION_MONTHS,
+    evaluation_months=WALK_FORWARD_EVALUATION_MONTHS,
+    roll_months=WALK_FORWARD_ROLL_MONTHS,
+    min_valid_folds=WALK_FORWARD_MIN_VALID_FOLDS,
+    min_unique_evaluation_months=WALK_FORWARD_MIN_UNIQUE_EVALUATION_MONTHS,
+    min_unique_evaluation_sessions=WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+)
+
+
+@dataclass(frozen=True)
+class _SplitPolicy:
+    warmup_sessions: tuple[str, ...]
+    folds: tuple[_WalkForwardFold, ...]
+    final_lockbox_sessions: tuple[str, ...]
+    walk_forward: WalkForwardPolicy = FIVE_YEAR_WALK_FORWARD_POLICY
+
+
+@dataclass(frozen=True)
+class _WalkForwardSample:
+    session_count: int
+    valid_fold_count: int
+    unique_evaluation_month_count: int
+    unique_evaluation_session_count: int
+    status: str
+    policy: WalkForwardPolicy = FIVE_YEAR_WALK_FORWARD_POLICY
+
+
+@dataclass(frozen=True)
+class _PreparedMarketCacheEntry:
+    price_rows: tuple[Mapping[str, Any], ...]
+    prepared_market: EnginePreparedMarketData
+
+
+class _DigestWriter:
+    def __init__(self, digest: Any) -> None:
+        self.digest = digest
+
+    def write(self, payload: bytes) -> int:
+        self.digest.update(payload)
+        return len(payload)
+
+
+# ponytail: one process-local entry bounds retained memory; use a shared cache only
+# when cross-process hit rates justify serializing the full prepared market.
+_PREPARED_MARKET_CACHE: tuple[tuple[str, str], _PreparedMarketCacheEntry] | None = None
+_PREPARED_MARKET_CACHE_LOCK = Lock()
+
+
+def _get_prepared_market(key: tuple[str, str]) -> _PreparedMarketCacheEntry | None:
+    with _PREPARED_MARKET_CACHE_LOCK:
+        cached = _PREPARED_MARKET_CACHE
+    return cached[1] if cached is not None and cached[0] == key else None
+
+
+def _store_prepared_market(key: tuple[str, str], entry: _PreparedMarketCacheEntry) -> None:
+    global _PREPARED_MARKET_CACHE
+    with _PREPARED_MARKET_CACHE_LOCK:
+        _PREPARED_MARKET_CACHE = (key, entry)
+
+
+def _clear_prepared_market_cache() -> None:
+    global _PREPARED_MARKET_CACHE
+    with _PREPARED_MARKET_CACHE_LOCK:
+        _PREPARED_MARKET_CACHE = None
+
+
+_WORKER_STRATEGY: AIStrategySpec | None = None
+_WORKER_PRICE_ROWS: Sequence[Mapping[str, Any]] | None = None
+_WORKER_PREPARED_MARKET: EnginePreparedMarketData | None = None
+_WORKER_FEATURE_STORE: PreparedFeatureStore | None = None
+_WORKER_BENCHMARK_CONTEXT: _BenchmarkContext | None = None
+# Cleared with the rows it was built from, so a fold key can never resolve against a
+# different universe.
+_WORKER_FOLD_PREP = _FoldPrepCache()
+_FOLD_PREPARATION_CANDIDATE = CodeCandidate(
+    candidate_id="prepare",
+    variant="A",
+    code="def build_signals(prices):\n    return []\n",
+    validation_ok=True,
+)
+
+
+def _initialize_candidate_worker(
+    strategy_payload: Mapping[str, Any],
+    price_rows: Sequence[Mapping[str, Any]],
+    prepared_market: EnginePreparedMarketData,
+    feature_store: PreparedFeatureStore,
+    benchmark_context: _BenchmarkContext,
+) -> None:
+    global _WORKER_STRATEGY, _WORKER_PRICE_ROWS, _WORKER_PREPARED_MARKET
+    global _WORKER_FEATURE_STORE, _WORKER_BENCHMARK_CONTEXT
+    _WORKER_STRATEGY = AIStrategySpec.model_validate(strategy_payload)
+    _WORKER_PRICE_ROWS = price_rows
+    _WORKER_PREPARED_MARKET = prepared_market
+    _WORKER_FEATURE_STORE = feature_store
+    _WORKER_BENCHMARK_CONTEXT = benchmark_context
+    _WORKER_FOLD_PREP.clear()
+
+
+def _fold_engine_worker(task: _FoldEngineTask) -> _FoldEngineOutcome:
+    if _WORKER_STRATEGY is None or _WORKER_PRICE_ROWS is None or _WORKER_FEATURE_STORE is None:
+        raise RuntimeError("candidate worker was not initialized")
+    return _fold_engine_outcome(
+        _WORKER_STRATEGY,
+        _WORKER_PRICE_ROWS,
+        task,
+        _WORKER_FOLD_PREP,
+        _WORKER_FEATURE_STORE,
+    )
+
+
+def _evaluate_candidate_worker(
+    task: tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str],
+) -> _CandidateTaskResult:
+    if (
+        _WORKER_STRATEGY is None
+        or _WORKER_PRICE_ROWS is None
+        or _WORKER_PREPARED_MARKET is None
+        or _WORKER_FEATURE_STORE is None
+        or _WORKER_BENCHMARK_CONTEXT is None
+    ):
+        raise RuntimeError("candidate worker was not initialized")
+    candidate_payload, actions, scores, metrics_mode = task
+    return _evaluate_candidate_task(
+        _WORKER_STRATEGY,
+        CodeCandidate.model_validate(candidate_payload),
+        _WORKER_PRICE_ROWS,
+        prepared_market=_WORKER_PREPARED_MARKET,
+        feature_store=_WORKER_FEATURE_STORE,
+        benchmark_context=_WORKER_BENCHMARK_CONTEXT,
+        generated_actions=actions,
+        generated_scores=scores,
+        metrics_mode=metrics_mode,
+    )
+
+
+class BacktestCacheConfigurationError(RuntimeError):
+    """Raised when the disk cache directory is not configured under a release profile."""
+
+
+def backtest_cache_ready() -> tuple[bool, str | None]:
+    """Readiness probe mirroring _DiskEvaluationCache's precondition.
+
+    The cache used to be checked only when the first backtest ran, so a launcher that
+    forgot AI_BACKTEST_CACHE_DIR passed /readiness and failed on the first user job.
+    """
+
+    configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
+    if not configured:
+        if is_release_profile():
+            return False, "backtest_cache_dir_required"
+        return True, None
+    root = Path(configured)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False, "backtest_cache_dir_unwritable"
+    if not os.access(root, os.W_OK):
+        return False, "backtest_cache_dir_unwritable"
+    return True, None
+
+
+class _DiskEvaluationCache:
+    def __init__(self) -> None:
+        configured = os.getenv(BACKTEST_CACHE_DIR_ENV)
+        if not configured and is_release_profile():
+            # A shared /tmp fallback under a release profile silently mixes cache
+            # entries across deployments and is wiped by the host at will. Fail
+            # closed and make the operator point at a persistent directory.
+            raise BacktestCacheConfigurationError(
+                f"{BACKTEST_CACHE_DIR_ENV} must point at a persistent directory under a "
+                "release profile; refusing to fall back to a shared temp directory."
+            )
+        self.root = (
+            Path(configured) if configured else Path(gettempdir()) / "quantagent-backtest-v2"
+        )
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.ttl_seconds = _positive_int_env(BACKTEST_CACHE_TTL_ENV, DEFAULT_CACHE_TTL_SECONDS)
+        self.max_bytes = _positive_int_env(BACKTEST_CACHE_MAX_BYTES_ENV, DEFAULT_CACHE_MAX_BYTES)
+        # No sweep on construction: cleanup is amortized across writes in store().
+        self._writes_since_cleanup = 0
+
+    def load(
+        self,
+        key: str,
+        candidate: CodeCandidate,
+    ) -> _CandidateEvaluation | None:
+        path = self.root / f"{key}.json"
+        try:
+            if not path.is_file():
+                return None
+            if time.time() - path.stat().st_mtime > self.ttl_seconds:
+                path.unlink(missing_ok=True)
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != BACKTEST_CACHE_SCHEMA_VERSION:
+                path.unlink(missing_ok=True)
+                return None
+            stored = CodeCandidate.model_validate(payload["candidate"])
+            rebound = candidate.model_copy(
+                update={
+                    "validation_ok": stored.validation_ok,
+                    "violations": stored.violations,
+                    "metrics": stored.metrics,
+                }
+            )
+            diagnostics = dict(payload.get("diagnostics") or {})
+            diagnostics["cache_hit"] = True
+            diagnostics["cache_level"] = "disk"
+            evaluation = _CandidateEvaluation(
+                candidate=rebound,
+                engine_summary=payload.get("engine_summary"),
+                equity_curve=[
+                    BacktestEquityPoint.model_validate(item)
+                    for item in payload.get("equity_curve") or []
+                ]
+                or None,
+                objective_score=payload.get("objective_score"),
+                quantstats_dependency_error=bool(payload.get("quantstats_dependency_error", False)),
+                diagnostics=diagnostics,
+                ticker_actions=list(payload.get("ticker_actions") or []),
+            )
+            if not _is_cacheable_evaluation(evaluation):
+                path.unlink(missing_ok=True)
+                return None
+            return evaluation
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            path.unlink(missing_ok=True)
+            return None
+
+    def store(self, key: str, evaluation: _CandidateEvaluation) -> int:
+        if not _is_cacheable_evaluation(evaluation):
+            return 0
+        path = self.root / f"{key}.json"
+        temporary = self.root / f".{key}.{os.getpid()}.tmp"
+        payload = {
+            "schema_version": BACKTEST_CACHE_SCHEMA_VERSION,
+            "candidate": evaluation.candidate.model_dump(mode="json"),
+            "engine_summary": evaluation.engine_summary,
+            "equity_curve": [
+                point.model_dump(mode="json") for point in evaluation.equity_curve or []
+            ],
+            "objective_score": evaluation.objective_score,
+            "quantstats_dependency_error": evaluation.quantstats_dependency_error,
+            "diagnostics": evaluation.diagnostics or {},
+            # Without this a cache hit returns an evaluation with no per-stock verdict, so
+            # a re-run of the same strategy would show performance and no recommendations.
+            "ticker_actions": evaluation.ticker_actions,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
+            os.replace(temporary, path)
+            size = path.stat().st_size
+        finally:
+            temporary.unlink(missing_ok=True)
+        self._writes_since_cleanup += 1
+        if self._writes_since_cleanup >= CACHE_CLEANUP_WRITE_INTERVAL:
+            self._writes_since_cleanup = 0
+            self._cleanup()
+        return size
+
+    def _cleanup(self) -> None:
+        now = time.time()
+        files: list[tuple[float, int, Path]] = []
+        for path in self.root.glob("*.json"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if now - stat.st_mtime > self.ttl_seconds:
+                path.unlink(missing_ok=True)
+                continue
+            files.append((stat.st_mtime, stat.st_size, path))
+        total = sum(size for _, size, _ in files)
+        for _, size, path in sorted(files):
+            if total <= self.max_bytes:
+                break
+            path.unlink(missing_ok=True)
+            total -= size
+
+
+class _CandidateBacktestSession:
+    """Reuse prepared columns, one worker pool, and candidate results across rounds."""
+
+    def __init__(
+        self,
+        strategy: AIStrategySpec,
+        price_rows: Sequence[Mapping[str, Any]],
+        *,
+        official_benchmark: Mapping[str, Any] | None = None,
+    ) -> None:
+        prep_started = time.perf_counter()
+        self.strategy = strategy
+        self.official_benchmark = official_benchmark
+        phases: dict[str, float] = {}
+
+        started = time.perf_counter()
+        self.data_fingerprint, self.data_descriptor = _data_fingerprint(price_rows)
+        self.strategy_fingerprint = _strategy_fingerprint(strategy)
+        phases["fingerprint_seconds"] = time.perf_counter() - started
+
+        cache_key = (self.data_fingerprint, self.strategy_fingerprint)
+        started = time.perf_counter()
+        cached = _get_prepared_market(cache_key)
+        phases["cache_lookup_seconds"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        if cached is None:
+            self.feature_store = PreparedFeatureStore(
+                price_rows,
+                rows_are_sorted=bool(self.data_descriptor["rows_are_sorted"]),
+            )
+            self.price_rows = self.feature_store.rows
+        else:
+            self.price_rows = cached.price_rows
+            self.feature_store = PreparedFeatureStore(
+                self.price_rows,
+                rows_are_sorted=True,
+            )
+        phases["feature_store_seconds"] = time.perf_counter() - started
+
+        self.prepared_market_cache_hit = cached is not None
+        if cached is not None:
+            self.prepared_market = cached.prepared_market
+            phases["engine_row_conversion_seconds"] = 0.0
+            phases["engine_market_index_seconds"] = 0.0
+        else:
+            started = time.perf_counter()
+            ohlcv_rows, metric_rows = _engine_market_rows(self.price_rows)
+            phases["engine_row_conversion_seconds"] = time.perf_counter() - started
+
+            preparation_candidate = CodeCandidate(
+                candidate_id="prepare",
+                variant="A",
+                code="def build_signals(prices):\n    return []\n",
+                validation_ok=True,
+            )
+            preparation_spec = _engine_strategy_spec(
+                strategy,
+                preparation_candidate,
+                available_ticker_count=_available_ticker_count(self.price_rows),
+                execution_capacity_enabled=_execution_capacity_enabled(self.price_rows),
+            )
+            engine_config = EngineBacktestRunConfig(
+                initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+                write_outputs=False,
+                talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+                metrics_mode="selection",
+            )
+            started = time.perf_counter()
+            self.prepared_market = prepare_engine_market_data(
+                preparation_spec,
+                ohlcv_rows=ohlcv_rows,
+                metric_rows=metric_rows,
+                config=engine_config,
+                inputs_normalized=True,
+            )
+            phases["engine_market_index_seconds"] = time.perf_counter() - started
+            _store_prepared_market(
+                cache_key,
+                _PreparedMarketCacheEntry(
+                    price_rows=self.price_rows,
+                    prepared_market=self.prepared_market,
+                ),
+            )
+
+        started = time.perf_counter()
+        self.benchmark_context = _build_benchmark_context(self.price_rows, official_benchmark)
+        phases["benchmark_context_seconds"] = time.perf_counter() - started
+
+        self.preparation_phases = {name: round(seconds, 6) for name, seconds in phases.items()}
+        self.preparation_seconds = time.perf_counter() - prep_started
+        self._base_feature_estimated_bytes = self.feature_store.stats().estimated_bytes
+        self._cache: dict[tuple[str, bool, str], _CandidateEvaluation] = {}
+        # (candidate identity, fold, pass) -> reduced fold result. Survives a
+        # self-improvement round, so a round only pays for its new candidates.
+        self._fold_cache: dict[tuple[Any, ...], _FoldEngineOutcome] = {}
+        self._fold_prep = _FoldPrepCache()
+        self.fold_engine_runs = 0
+        self.fold_cache_hits = 0
+        self._action_cache: dict[str, Sequence[int]] = {}
+        self._score_cache: dict[str, Sequence[float]] = {}
+        self._worker_feature_bytes: dict[int, int] = {}
+        self._worker_feature_lookbacks: set[int] = set()
+        self._disk_cache = _DiskEvaluationCache()
+        self._executor: ProcessPoolExecutor | None = None
+        self._executor_workers = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.disk_cache_bytes_written = 0
+        self.evaluation_rounds: list[dict[str, Any]] = []
+
+    def __enter__(self) -> _CandidateBacktestSession:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._fold_prep.clear()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+            self._executor_workers = 0
+
+    def evaluate(
+        self,
+        candidates: Sequence[CodeCandidate],
+        *,
+        metrics_mode: str = "selection",
+    ) -> list[_CandidateEvaluation]:
+        round_started = time.perf_counter()
+        missing: list[CodeCandidate] = []
+        missing_keys: set[tuple[str, bool, str]] = set()
+        cache_levels: dict[tuple[str, bool, str], str] = {}
+        round_worker_count = 0
+        action_build_seconds = 0.0
+        memory_hits = 0
+        disk_hits = 0
+        for candidate in candidates:
+            memory_key = _candidate_cache_key(candidate, metrics_mode)
+            if memory_key in self._cache:
+                cache_levels[memory_key] = "memory"
+                memory_hits += 1
+                self.cache_hits += 1
+                continue
+            disk_key = self._disk_cache_key(candidate, metrics_mode)
+            cached = self._disk_cache.load(disk_key, candidate)
+            if cached is not None:
+                self._cache[memory_key] = cached
+                cache_levels[memory_key] = "disk"
+                disk_hits += 1
+                self.cache_hits += 1
+                continue
+            if memory_key not in missing_keys:
+                missing.append(candidate)
+                missing_keys.add(memory_key)
+            self.cache_misses += 1
+
+        round_action_cache_hits = sum(
+            _candidate_identity(candidate) in self._action_cache for candidate in missing
+        )
+        if missing:
+            round_worker_count = _candidate_worker_count(
+                len(missing),
+                row_count=len(self.price_rows),
+            )
+            tasks = [
+                (
+                    candidate.model_dump(mode="python"),
+                    self._action_cache.get(_candidate_identity(candidate)),
+                    self._score_cache.get(_candidate_identity(candidate)),
+                    metrics_mode,
+                )
+                for candidate in missing
+            ]
+            requires_isolation = any(
+                candidate.representation == "python_fallback" for candidate in missing
+            )
+            reuse_executor = self._executor is not None
+            if round_worker_count == 1 and not requires_isolation and not reuse_executor:
+                task_results = [
+                    _evaluate_candidate_task(
+                        self.strategy,
+                        candidate,
+                        self.price_rows,
+                        prepared_market=self.prepared_market,
+                        feature_store=self.feature_store,
+                        benchmark_context=self.benchmark_context,
+                        generated_actions=self._action_cache.get(_candidate_identity(candidate)),
+                        generated_scores=self._score_cache.get(_candidate_identity(candidate)),
+                        metrics_mode=metrics_mode,
+                    )
+                    for candidate in missing
+                ]
+            else:
+                task_results = self._evaluate_parallel(
+                    tasks,
+                    missing,
+                    (self._executor_workers if reuse_executor else max(1, round_worker_count)),
+                )
+            action_seconds_by_pid: dict[int, float] = {}
+            for result in task_results:
+                if result.action_build_seconds > 0.0:
+                    action_seconds_by_pid[result.worker_pid] = (
+                        action_seconds_by_pid.get(result.worker_pid, 0.0)
+                        + result.action_build_seconds
+                    )
+                if result.generated_actions is not None:
+                    identity = _candidate_identity(result.evaluation.candidate)
+                    self._action_cache[identity] = result.generated_actions
+                    if result.generated_scores is not None:
+                        self._score_cache[identity] = result.generated_scores
+                if result.worker_pid != os.getpid():
+                    self._worker_feature_bytes[result.worker_pid] = max(
+                        self._worker_feature_bytes.get(result.worker_pid, 0),
+                        result.feature_estimated_bytes,
+                    )
+                    self._worker_feature_lookbacks.update(result.feature_cached_lookbacks)
+            action_build_seconds = max(action_seconds_by_pid.values(), default=0.0)
+            action_build_total_seconds = sum(action_seconds_by_pid.values())
+            for candidate, result in zip(missing, task_results, strict=True):
+                evaluation = result.evaluation
+                memory_key = _candidate_cache_key(candidate, metrics_mode)
+                self._cache[memory_key] = evaluation
+                disk_key = self._disk_cache_key(candidate, metrics_mode)
+                try:
+                    self.disk_cache_bytes_written += self._disk_cache.store(disk_key, evaluation)
+                except (OSError, TypeError, ValueError):
+                    pass
+        else:
+            action_build_total_seconds = 0.0
+            action_seconds_by_pid = {}
+
+        self.evaluation_rounds.append(
+            {
+                "metrics_mode": metrics_mode,
+                "requested_candidates": len(candidates),
+                "new_candidates": len(missing),
+                "cached_candidates": memory_hits + disk_hits,
+                "memory_cache_hits": memory_hits,
+                "disk_cache_hits": disk_hits,
+                "worker_count": round_worker_count,
+                "action_build_seconds": round(action_build_seconds, 6),
+                "action_build_total_seconds": round(action_build_total_seconds, 6),
+                "action_worker_pids": sorted(action_seconds_by_pid),
+                "action_cache_hits": round_action_cache_hits,
+                "cumulative_candidates": len(
+                    {key[0] for key in self._cache if key[2] == "selection"}
+                ),
+                "wall_seconds": round(time.perf_counter() - round_started, 6),
+            }
+        )
+        return [
+            _rebind_evaluation(
+                self._cache[_candidate_cache_key(candidate, metrics_mode)],
+                candidate,
+                cache_level=cache_levels.get(_candidate_cache_key(candidate, metrics_mode)),
+            )
+            for candidate in candidates
+        ]
+
+    def run_fold_engines(
+        self, tasks: Sequence[tuple[tuple[Any, ...], _FoldEngineTask]]
+    ) -> list[_FoldEngineOutcome]:
+        """Fold engine runs, memoized per (candidate, fold, pass) and run on the pool.
+
+        A self-improvement round re-runs the whole walk-forward with a wider candidate
+        set, and every round used to re-evaluate every candidate over every fold: round
+        three of a six-per-round search paid for 21 candidates instead of the 6 it added.
+        The per-fold argmax is still recomputed over the full set - only the engine runs
+        behind it are cached.
+        """
+
+        missing = [(key, task) for key, task in tasks if key not in self._fold_cache]
+        self.fold_cache_hits += len(tasks) - len(missing)
+        if missing:
+            worker_count = (
+                self._executor_workers
+                if self._executor is not None
+                else _fold_worker_count(len(missing))
+            )
+            if worker_count > 1:
+                outcomes = self._map_fold_tasks([task for _, task in missing], worker_count)
+            else:
+                outcomes = [
+                    _fold_engine_outcome(
+                        self.strategy,
+                        self.price_rows,
+                        task,
+                        self._fold_prep,
+                        self.feature_store,
+                    )
+                    for _, task in missing
+                ]
+            self.fold_engine_runs += len(missing)
+            for (key, _), outcome in zip(missing, outcomes, strict=True):
+                self._fold_cache[key] = outcome
+        return [self._fold_cache[key] for key, _ in tasks]
+
+    def _map_fold_tasks(
+        self, tasks: Sequence[_FoldEngineTask], worker_count: int
+    ) -> list[_FoldEngineOutcome]:
+        executor = self._ensure_executor(worker_count)
+        futures = [executor.submit(_fold_engine_worker, task) for task in tasks]
+        remaining = deadline_remaining_seconds()
+        # Read back in submission order: which candidate a fold selects must not depend
+        # on which worker happened to finish first.
+        timeout = None if remaining is None else max(1.0, remaining)
+        try:
+            return [future.result(timeout=timeout) for future in futures]
+        except BaseException:
+            self._terminate_executor()
+            for future in futures:
+                future.cancel()
+            raise
+
+    def _ensure_executor(self, worker_count: int) -> ProcessPoolExecutor:
+        if self._executor is not None and self._executor_workers != worker_count:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+            self._executor_workers = 0
+        if self._executor is None:
+            start_method = "fork" if "fork" in get_all_start_methods() else "spawn"
+            self._executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=get_context(start_method),
+                initializer=_initialize_candidate_worker,
+                initargs=(
+                    self.strategy.model_dump(mode="python"),
+                    self.price_rows,
+                    self.prepared_market,
+                    self.feature_store,
+                    self.benchmark_context,
+                ),
+            )
+            self._executor_workers = worker_count
+        return self._executor
+
+    def _evaluate_parallel(
+        self,
+        tasks: list[tuple[Mapping[str, Any], Sequence[int] | None, Sequence[float] | None, str]],
+        candidates: list[CodeCandidate],
+        worker_count: int,
+    ) -> list[_CandidateTaskResult]:
+        executor = self._ensure_executor(worker_count)
+        futures = [executor.submit(_evaluate_candidate_worker, task) for task in tasks]
+        timeout = _candidate_timeout_seconds()
+        # Collect completed work immediately. Previously a slow first submission hid
+        # already-finished later candidates and caused all of them to be marked timed
+        # out. One timeout window is allowed for each worker wave so queued candidates
+        # still receive a full execution budget.
+        wave_count = max(1, math.ceil(len(futures) / max(1, worker_count)))
+        # `timeout * wave_count` grows with the candidate count, so on its own this is not
+        # a bound at all. Whatever the request has left is the real ceiling; without the
+        # clamp a single wide round can outlast the whole request budget.
+        wave_budget = timeout * wave_count
+        request_remaining = deadline_remaining_seconds()
+        if request_remaining is not None:
+            wave_budget = min(wave_budget, max(0.0, request_remaining))
+        deadline = time.perf_counter() + wave_budget
+        evaluations: list[_CandidateTaskResult | None] = [None] * len(futures)
+        future_indexes: dict[Future[_CandidateTaskResult], int] = {
+            future: index for index, future in enumerate(futures)
+        }
+        pending: set[Future[_CandidateTaskResult]] = set(futures)
+        while pending:
+            # Stop before the next wave when the run was cancelled, so a cancel does
+            # not have to wait for every already-queued candidate to finish.
+            try:
+                raise_if_cancelled()
+            except AnalysisCancelled:
+                self._terminate_executor()
+                for unresolved in pending:
+                    unresolved.cancel()
+                raise
+            remaining_seconds = deadline - time.perf_counter()
+            if remaining_seconds <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining_seconds,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            try:
+                for future in completed:
+                    evaluations[future_indexes[future]] = future.result()
+            except BaseException:
+                self._terminate_executor()
+                for unresolved in pending:
+                    unresolved.cancel()
+                raise
+
+        if pending:
+            self._terminate_executor()
+            for future in pending:
+                future.cancel()
+                index = future_indexes[future]
+                evaluations[index] = _CandidateTaskResult(
+                    evaluation=_timeout_evaluation(candidates[index], timeout),
+                    generated_actions=None,
+                    generated_scores=None,
+                    action_build_seconds=0.0,
+                    action_cache_hit=False,
+                    worker_pid=0,
+                    feature_cached_lookbacks=(),
+                    feature_estimated_bytes=0,
+                )
+
+        if any(evaluation is None for evaluation in evaluations):
+            raise RuntimeError("candidate worker completed without an evaluation")
+        return [evaluation for evaluation in evaluations if evaluation is not None]
+
+    def _terminate_executor(self) -> None:
+        executor = self._executor
+        if executor is None:
+            return
+        processes = list(getattr(executor, "_processes", {}).values())
+        executor.shutdown(wait=False, cancel_futures=True)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+        self._executor = None
+        self._executor_workers = 0
+
+    def _disk_cache_key(self, candidate: CodeCandidate, metrics_mode: str) -> str:
+        payload = {
+            "cache_schema": BACKTEST_CACHE_SCHEMA_VERSION,
+            "engine_version": BACKTEST_ENGINE_VERSION,
+            "feature_version": FEATURE_DEFINITION_VERSION,
+            "data_version": self.data_fingerprint,
+            "universe": self.data_descriptor,
+            "strategy_sha": self.strategy_fingerprint,
+            "candidate_sha": _candidate_identity(candidate),
+            "validation_ok": candidate.validation_ok,
+            "metrics_mode": metrics_mode,
+            "benchmark": {
+                "available": self.benchmark_context.primary_available,
+                "return": self.benchmark_context.total_return,
+            },
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        return sha256(encoded.encode("utf-8")).hexdigest()
+
+    def execution_stats(self) -> dict[str, Any]:
+        feature_stats = self.feature_store.stats()
+        worker_feature_bytes = sum(
+            max(0, size - self._base_feature_estimated_bytes)
+            for size in self._worker_feature_bytes.values()
+        )
+        return {
+            "engine_version": BACKTEST_ENGINE_VERSION,
+            "feature_version": FEATURE_DEFINITION_VERSION,
+            "data_fingerprint": self.data_fingerprint,
+            "feature_preparation_seconds": round(self.preparation_seconds, 6),
+            "feature_preparation_phases": dict(self.preparation_phases),
+            "prepared_market_cache_hit": self.prepared_market_cache_hit,
+            "feature_estimated_bytes": feature_stats.estimated_bytes + worker_feature_bytes,
+            "feature_cached_lookbacks": sorted(
+                {*feature_stats.cached_lookbacks, *self._worker_feature_lookbacks}
+            ),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "disk_cache_bytes_written": self.disk_cache_bytes_written,
+            "fold_engine_runs": self.fold_engine_runs,
+            "fold_cache_hits": self.fold_cache_hits,
+            "rounds": list(self.evaluation_rounds),
+        }
+
+
+def _fold_worker_count(task_count: int) -> int:
+    """Workers for a batch of fold engine runs.
+
+    `_candidate_worker_count` gates on total work items because a full-window candidate
+    run is one pass over every row. A fold task is a whole engine run of its own -
+    measured at ~1s on production - so the row-count gate would send every round of a
+    six-candidate search down the serial path. The spawn rule still applies: Windows
+    stays serial unless an operator opts into the memory trade-off.
+    """
+
+    if task_count <= 1:
+        return 1
+    if "fork" not in get_all_start_methods() and not _truthy_env(
+        AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV
+    ):
+        return 1
+    return max(1, min(task_count, _configured_worker_limit(), os.cpu_count() or 1))
+
+
+def _candidate_worker_count(candidate_count: int, *, row_count: int = 0) -> int:
+    requested = _configured_worker_limit()
+    available_cpus = os.cpu_count() or 1
+    if candidate_count * row_count < SERIAL_EVALUATION_WORK_ITEMS:
+        return 1
+    requested = max(1, min(candidate_count, requested, available_cpus))
+    if requested <= 1:
+        return 1
+    # fork shares prepared market data copy-on-write. spawn serializes the same large
+    # object into every worker; the measured Windows production input tripled RSS for
+    # only a small wall-time gain. Keep spawn serial unless an operator explicitly opts
+    # into that memory trade-off.
+    if "fork" not in get_all_start_methods() and not _truthy_env(
+        AI_BACKTEST_ALLOW_SPAWN_PARALLEL_ENV
+    ):
+        return 1
+    return requested
+
+
+def _configured_worker_limit() -> int:
+    configured = os.getenv(AI_BACKTEST_WORKERS_ENV)
+    try:
+        requested = int(configured) if configured is not None else DEFAULT_BACKTEST_WORKERS
+    except ValueError:
+        requested = DEFAULT_BACKTEST_WORKERS
+    return max(1, requested)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _candidate_cache_key(
+    candidate: CodeCandidate, metrics_mode: str = "selection"
+) -> tuple[str, bool, str]:
+    return _candidate_identity(candidate), candidate.validation_ok, metrics_mode
+
+
+def _candidate_identity(candidate: CodeCandidate) -> str:
+    if (
+        candidate.representation == "structured"
+        and candidate.strategy_ir is not None
+        and candidate.parameters is not None
+    ):
+        payload: Any = {
+            "strategy_ir": candidate.strategy_ir.model_dump(mode="json"),
+            "parameters": candidate.parameters.model_dump(mode="json"),
+        }
+    else:
+        payload = {"code_sha": sha256(candidate.code.encode("utf-8")).hexdigest()}
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _rebind_evaluation(
+    evaluation: _CandidateEvaluation,
+    candidate: CodeCandidate,
+    *,
+    cache_level: str | None = None,
+) -> _CandidateEvaluation:
+    rebound = candidate.model_copy(
+        update={
+            "validation_ok": evaluation.candidate.validation_ok,
+            "violations": evaluation.candidate.violations,
+            "metrics": evaluation.candidate.metrics,
+        }
+    )
+    diagnostics = dict(evaluation.diagnostics or {})
+    diagnostics["candidate_id"] = candidate.candidate_id
+    if cache_level is not None:
+        diagnostics["cache_hit"] = True
+        diagnostics["cache_level"] = cache_level
+    return _CandidateEvaluation(
+        candidate=rebound,
+        engine_summary=evaluation.engine_summary,
+        equity_curve=evaluation.equity_curve,
+        objective_score=evaluation.objective_score,
+        quantstats_dependency_error=evaluation.quantstats_dependency_error,
+        diagnostics=diagnostics,
+        # Identical code is evaluated once and rebound to every candidate id that shares
+        # it. Leaving this out meant the shared evaluation kept its per-stock verdict and
+        # every rebound copy silently lost it.
+        ticker_actions=[
+            {**action, "source_candidate_id": candidate.candidate_id}
+            for action in evaluation.ticker_actions
+        ],
+    )
+
+
+def _data_fingerprint(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    tickers: set[str] = set()
+    first_date: str | None = None
+    last_date: str | None = None
+    previous_sort_key: tuple[str, str] | None = None
+    rows_are_sorted = True
+    for row in rows:
+        ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        row_date = str(row.get("date") or "")
+        tickers.add(ticker)
+        first_date = row_date if first_date is None else min(first_date, row_date)
+        last_date = row_date if last_date is None else max(last_date, row_date)
+        sort_key = (row_date, ticker)
+        if previous_sort_key is not None and sort_key < previous_sort_key:
+            rows_are_sorted = False
+        previous_sort_key = sort_key
+
+    digest = sha256()
+    try:
+        pickle.Pickler(_DigestWriter(digest), protocol=pickle.HIGHEST_PROTOCOL).dump(rows)
+    except (AttributeError, pickle.PicklingError, TypeError):
+        digest = sha256()
+        for row in rows:
+            encoded = json.dumps(
+                dict(row),
+                ensure_ascii=True,
+                default=str,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            digest.update(encoded.encode("utf-8"))
+            digest.update(b"\n")
+    descriptor = {
+        "row_count": len(rows),
+        "ticker_count": len(tickers),
+        "tickers_sha": sha256(",".join(sorted(tickers)).encode("utf-8")).hexdigest(),
+        "first_date": first_date,
+        "last_date": last_date,
+        "rows_are_sorted": rows_are_sorted,
+    }
+    return digest.hexdigest(), descriptor
+
+
+def _strategy_fingerprint(strategy: AIStrategySpec) -> str:
+    payload = json.dumps(
+        strategy.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _candidate_timeout_seconds() -> float:
+    try:
+        value = float(
+            os.getenv(
+                AI_BACKTEST_CANDIDATE_TIMEOUT_ENV,
+                str(DEFAULT_CANDIDATE_TIMEOUT_SECONDS),
+            )
+        )
+    except ValueError:
+        return DEFAULT_CANDIDATE_TIMEOUT_SECONDS
+    return value if value > 0.0 else DEFAULT_CANDIDATE_TIMEOUT_SECONDS
+
+
+def _wall_budget_seconds() -> float:
+    try:
+        value = float(
+            os.getenv(
+                AI_BACKTEST_WALL_BUDGET_ENV,
+                str(DEFAULT_WALL_BUDGET_SECONDS),
+            )
+        )
+    except ValueError:
+        return DEFAULT_WALL_BUDGET_SECONDS
+    return value if value > 0.0 else DEFAULT_WALL_BUDGET_SECONDS
+
+
+def _timeout_evaluation(
+    candidate: CodeCandidate,
+    timeout_seconds: float,
+) -> _CandidateEvaluation:
+    message = f"candidate execution exceeded {timeout_seconds:g}s timeout"
+    return _CandidateEvaluation(
+        candidate=candidate.model_copy(
+            update={
+                "validation_ok": False,
+                "violations": [*candidate.violations, message],
+            }
+        ),
+        diagnostics={
+            "candidate_id": candidate.candidate_id,
+            "stage": "candidate_evaluation",
+            "cache_hit": False,
+            "error_type": "TimeoutError",
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+
+
+def _peak_rss_bytes() -> int | None:
+    try:
+        import psutil
+
+        process = psutil.Process()
+        total = int(process.memory_info().rss)
+        for child in process.children(recursive=True):
+            try:
+                total += int(child.memory_info().rss)
+            except psutil.Error:
+                continue
+        return total
+    except (ImportError, OSError):
+        return None
+
+
+def _evaluate_candidate_task(
+    strategy_a: AIStrategySpec,
+    candidate: CodeCandidate,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    prepared_market: EnginePreparedMarketData,
+    feature_store: PreparedFeatureStore,
+    benchmark_context: _BenchmarkContext,
+    generated_actions: Sequence[int] | None,
+    generated_scores: Sequence[float] | None,
+    metrics_mode: str,
+) -> _CandidateTaskResult:
+    wall_started = time.perf_counter()
+    cpu_started = time.process_time()
+    worker_pid = os.getpid()
+    action_cache_hit = generated_actions is not None
+    action_build_started = time.perf_counter()
+    actions = generated_actions
+    scores = generated_scores
+    if not candidate.validation_ok:
+        feature_stats = feature_store.stats()
+        return _CandidateTaskResult(
+            evaluation=_CandidateEvaluation(
+                candidate=candidate,
+                diagnostics={
+                    "candidate_id": candidate.candidate_id,
+                    "stage": "validation",
+                    "input_rows": len(rows),
+                    "generated_signals": 0,
+                    "cache_hit": False,
+                    "wall_seconds": 0.0,
+                    "cpu_seconds": 0.0,
+                    "action_build_seconds": 0.0,
+                    "action_cache_hit": action_cache_hit,
+                    "worker_pid": worker_pid,
+                },
+            ),
+            generated_actions=actions,
+            generated_scores=scores,
+            action_build_seconds=0.0,
+            action_cache_hit=action_cache_hit,
+            worker_pid=worker_pid,
+            feature_cached_lookbacks=feature_stats.cached_lookbacks,
+            feature_estimated_bytes=feature_stats.estimated_bytes,
+        )
+    try:
+        if actions is None:
+            if (
+                candidate.representation == "structured"
+                and candidate.strategy_ir is not None
+                and candidate.parameters is not None
+            ):
+                actions = feature_store.build_actions(
+                    candidate.strategy_ir,
+                    candidate.parameters,
+                )
+            else:
+                generated_signals = _execute_candidate_code(candidate, rows)
+                actions, scores = _compact_actions_from_signals(prepared_market, generated_signals)
+        action_build_seconds = (
+            0.0 if action_cache_hit else time.perf_counter() - action_build_started
+        )
+        engine_result = _run_candidate_backtest(
+            strategy_a,
+            candidate,
+            rows,
+            prepared_market=prepared_market,
+            generated_actions=actions,
+            generated_scores=scores,
+            metrics_mode=metrics_mode,
+        )
+    except Exception as exc:
+        action_build_seconds = (
+            0.0 if action_cache_hit else time.perf_counter() - action_build_started
+        )
+        diagnostics = {
+            "candidate_id": candidate.candidate_id,
+            "stage": "candidate_evaluation",
+            "input_rows": len(rows),
+            "generated_signals": len(actions or ()),
+            "cache_hit": False,
+            "wall_seconds": round(time.perf_counter() - wall_started, 6),
+            "cpu_seconds": round(time.process_time() - cpu_started, 6),
+            "error_type": type(exc).__name__,
+            "action_build_seconds": round(action_build_seconds, 6),
+            "action_cache_hit": action_cache_hit,
+            "worker_pid": worker_pid,
+        }
+        feature_stats = feature_store.stats()
+        if _is_quantstats_dependency_error(exc):
+            evaluation = _CandidateEvaluation(
+                candidate=candidate, quantstats_dependency_error=True, diagnostics=diagnostics
+            )
+        else:
+            evaluation = _CandidateEvaluation(
+                candidate=candidate.model_copy(
+                    update={
+                        "validation_ok": False,
+                        "violations": [*candidate.violations, f"engine backtest failed: {exc}"],
+                    }
+                ),
+                diagnostics=diagnostics,
+            )
+        return _CandidateTaskResult(
+            evaluation=evaluation,
+            generated_actions=actions,
+            generated_scores=scores,
+            action_build_seconds=action_build_seconds,
+            action_cache_hit=action_cache_hit,
+            worker_pid=worker_pid,
+            feature_cached_lookbacks=feature_stats.cached_lookbacks,
+            feature_estimated_bytes=feature_stats.estimated_bytes,
+        )
+
+    metrics = _metrics_from_engine_result(
+        engine_result,
+        benchmark_returns=benchmark_context.daily_returns,
+    )
+    metrics = _mask_unavailable_walk_forward_metrics(metrics, _walk_forward_sample(rows).status)
+    enriched_candidate = candidate.model_copy(update={"metrics": metrics})
+    engine_summary = dict(engine_result.summary)
+    execution_capacity_enabled = _execution_capacity_enabled(rows)
+    engine_summary["execution_capacity"] = _execution_capacity_metadata(execution_capacity_enabled)
+    engine_summary["buy_signal_count"] = _signal_action_count(engine_result, "BUY")
+    engine_summary["sell_signal_count"] = _signal_action_count(engine_result, "SELL")
+    execution_audit = _execution_audit(engine_result)
+    engine_summary["execution_audit"] = execution_audit
+    engine_summary["_storage_execution_ledger"] = _storage_execution_ledger(engine_result)
+    available_ticker_count = _available_ticker_count(rows)
+    requested_max_positions = _requested_max_positions(strategy_a)
+    applied_max_positions = _applied_max_positions(strategy_a, available_ticker_count)
+    engine_summary["ai_backtest_context"] = {
+        "analysis_initial_capital_krw": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+        "initial_capital_contract": "canonical_analysis_job_sealed_primary_contract",
+        "available_ticker_count": available_ticker_count,
+        "requested_max_positions": requested_max_positions,
+        "applied_max_positions": applied_max_positions,
+        "max_position_pct": _strategy_max_position_pct(strategy_a),
+        "sizing_contract": "strategy_risk_constraints.max_position_pct",
+        "gross_exposure_limit": 1.0,
+        "cash_floor": 0.0,
+        "leverage_allowed": False,
+        "exposure_normalized": applied_max_positions != requested_max_positions,
+    }
+    split_policy = _walk_forward_split_policy(rows)
+    walk_forward = _walk_forward_sample(rows)
+    engine_summary["walk_forward_sample"] = _walk_forward_metadata(walk_forward, split_policy)
+    engine_summary["benchmark_provenance"] = _benchmark_provenance(benchmark_context)
+    public_metric_availability = _undefined_metric_availability(
+        _summary_warning_list(engine_summary)
+    )
+    if walk_forward.status in {
+        INSUFFICIENT_WALK_FORWARD_SAMPLE,
+        UNSAFE_WALK_FORWARD_CANDIDATE,
+    }:
+        public_metric_availability.update(
+            {
+                "out_sample_return": {
+                    "value": None,
+                    "unavailable_reason": walk_forward.status,
+                },
+                "out_sample_sharpe": {
+                    "value": None,
+                    "unavailable_reason": walk_forward.status,
+                },
+                "benchmark_comparison": {
+                    "value": None,
+                    "unavailable_reason": walk_forward.status,
+                },
+            }
+        )
+    if public_metric_availability:
+        engine_summary["public_metric_availability"] = public_metric_availability
+    # Positions opened. Every closed round trip has a buy behind it, so this is never
+    # below the engine's own `trade_count`; stating it directly is what makes the number
+    # mean the same thing here and in the walk-forward summary.
+    engine_summary["effective_trade_count"] = float(execution_audit["executed_buy_count"])
+    engine_summary["filled_order_legs"] = float(
+        execution_audit["executed_buy_count"] + execution_audit["executed_sell_count"]
+    )
+    engine_summary["closed_trade_count"] = float(execution_audit["completed_trade_count"])
+    # This is produced beside the measured engine result, rather than reconstructed
+    # by an HTTP serializer.  The public projection will fail closed if any field is
+    # absent or malformed.
+    engine_summary["performance_method_manifest"] = _performance_method_manifest(
+        strategy_a,
+        candidate,
+        rows,
+        engine_summary,
+    )
+    engine_summary["selection_buy_count"] = _selection_signal_action_count(
+        engine_result, rows, "BUY"
+    )
+    evaluation = _CandidateEvaluation(
+        candidate=enriched_candidate,
+        engine_summary=engine_summary,
+        equity_curve=_public_equity_curve(engine_result),
+        objective_score=_objective_score(
+            metrics,
+            engine_summary,
+            rows,
+            benchmark_context=benchmark_context,
+        ),
+        ticker_actions=_ticker_actions(engine_result, rows, candidate.candidate_id),
+        diagnostics={
+            "candidate_id": candidate.candidate_id,
+            "stage": "candidate_evaluation",
+            "metrics_mode": metrics_mode,
+            "input_rows": len(rows),
+            "generated_signals": len(actions or ()),
+            "cache_hit": False,
+            "wall_seconds": round(time.perf_counter() - wall_started, 6),
+            "cpu_seconds": round(time.process_time() - cpu_started, 6),
+            "peak_rss_bytes": _peak_rss_bytes(),
+            "action_build_seconds": round(action_build_seconds, 6),
+            "action_cache_hit": action_cache_hit,
+            "worker_pid": worker_pid,
+        },
+    )
+    feature_stats = feature_store.stats()
+    return _CandidateTaskResult(
+        evaluation=evaluation,
+        generated_actions=actions,
+        generated_scores=scores,
+        action_build_seconds=action_build_seconds,
+        action_cache_hit=action_cache_hit,
+        worker_pid=worker_pid,
+        feature_cached_lookbacks=feature_stats.cached_lookbacks,
+        feature_estimated_bytes=feature_stats.estimated_bytes,
+    )
+
+
+def run_candidate_backtest(
+    strategy_a: AIStrategySpec,
+    candidates: list[CodeCandidate],
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    feature_coverage: Mapping[str, Any] | None = None,
+    fallback_reasons: Sequence[str] | None = None,
+    _session: _CandidateBacktestSession | None = None,
+    _walk_forward_enabled: bool = True,
+) -> CandidateBacktestResult:
+    if not candidates:
+        raise ValueError("at least one candidate is required")
+
+    rows = _session.price_rows if _session is not None else _price_rows(price_rows)
+    owns_session = _session is None
+    session = _session or _CandidateBacktestSession(strategy_a, rows)
+    sample = _walk_forward_sample(rows)
+    if _walk_forward_enabled and sample.status == READY_WALK_FORWARD:
+        try:
+            return _run_walk_forward_candidate_backtest(
+                strategy_a,
+                candidates,
+                rows,
+                feature_coverage=feature_coverage,
+                fallback_reasons=fallback_reasons,
+                session=session,
+            )
+        finally:
+            if owns_session:
+                session.close()
+    enriched_candidates: list[CodeCandidate] = []
+    engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
+    equity_curves_by_candidate: dict[str, list[BacktestEquityPoint]] = {}
+    objective_scores_by_candidate: dict[str, float] = {}
+    diagnostics_by_candidate: dict[str, dict[str, Any]] = {}
+    ticker_actions_by_candidate: dict[str, list[dict[str, Any]]] = {}
+
+    try:
+        evaluations = session.evaluate(candidates)
+        for evaluation in evaluations:
+            if evaluation.quantstats_dependency_error:
+                raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
+            candidate = evaluation.candidate
+            enriched_candidates.append(candidate)
+            if evaluation.diagnostics is not None:
+                diagnostics_by_candidate[candidate.candidate_id] = evaluation.diagnostics
+            if (
+                not candidate.validation_ok
+                or candidate.metrics is None
+                or evaluation.engine_summary is None
+                or evaluation.equity_curve is None
+                or evaluation.objective_score is None
+            ):
+                continue
+            engine_summaries_by_candidate[candidate.candidate_id] = evaluation.engine_summary
+            equity_curves_by_candidate[candidate.candidate_id] = evaluation.equity_curve
+            objective_scores_by_candidate[candidate.candidate_id] = evaluation.objective_score
+            ticker_actions_by_candidate[candidate.candidate_id] = evaluation.ticker_actions
+    except BaseException:
+        if owns_session:
+            session.close()
+        raise
+
+    valid_candidates = [
+        candidate
+        for candidate in enriched_candidates
+        if candidate.validation_ok and candidate.metrics is not None
+    ]
+    if not valid_candidates:
+        if any(
+            QUANTSTATS_REQUIRED_MESSAGE in violation
+            for candidate in enriched_candidates
+            for violation in getattr(candidate, "violations", [])
+        ):
+            if owns_session:
+                session.close()
+            raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
+        if owns_session:
+            session.close()
+        raise ValueError("at least one candidate must pass validation and engine backtest")
+
+    # The recommendation must be the strategy the user asked for. Selection used to be
+    # a plain argmax over every candidate, so a generic template that happened to score
+    # higher replaced the user's own rule - and the report then presented that template's
+    # performance as the answer. Measured on five prompts, the user's rule ran and lost
+    # on three of them; nothing in the result said so.
+    #
+    # Optimisation belongs inside the user's rule, not instead of it: variants of their
+    # compiled conditions compete with each other, and the generic profiles stay in the
+    # run only as baselines to compare against.
+    own_rule = [c for c in valid_candidates if _is_user_rule(c)]
+    selectable = own_rule or valid_candidates
+    selectable = _within_turnover_cap(selectable, engine_summaries_by_candidate, rows)
+    selected = max(
+        selectable,
+        key=lambda candidate: (
+            objective_scores_by_candidate.get(candidate.candidate_id, float("-inf")),
+            *_candidate_rank(candidate),
+        ),
+    )
+    try:
+        detailed = session.evaluate([selected], metrics_mode="full")[0]
+    except BaseException:
+        if owns_session:
+            session.close()
+        raise
+    if detailed.quantstats_dependency_error:
+        if owns_session:
+            session.close()
+        raise ModuleNotFoundError(QUANTSTATS_REQUIRED_MESSAGE)
+    if (
+        detailed.candidate.validation_ok
+        and detailed.candidate.metrics is not None
+        and detailed.engine_summary is not None
+        and detailed.equity_curve is not None
+        and detailed.objective_score is not None
+    ):
+        selected = detailed.candidate
+        enriched_candidates = [
+            selected if item.candidate_id == selected.candidate_id else item
+            for item in enriched_candidates
+        ]
+        engine_summaries_by_candidate[selected.candidate_id] = detailed.engine_summary
+        equity_curves_by_candidate[selected.candidate_id] = detailed.equity_curve
+        objective_scores_by_candidate[selected.candidate_id] = detailed.objective_score
+        ticker_actions_by_candidate[selected.candidate_id] = detailed.ticker_actions
+        if detailed.diagnostics is not None:
+            diagnostics_by_candidate[selected.candidate_id] = detailed.diagnostics
+
+    disclosed_coverage, disclosed_reasons = _metric_coverage_disclosure(
+        session.feature_store, selected, feature_coverage, fallback_reasons
+    )
+    try:
+        result = CandidateBacktestResult(
+            strategy_a=strategy_a,
+            candidates=enriched_candidates,
+            selected_candidate=selected,
+            equity_curve=equity_curves_by_candidate[selected.candidate_id],
+            engine_summary=engine_summaries_by_candidate[selected.candidate_id],
+            engine_summaries_by_candidate=engine_summaries_by_candidate,
+            objective_scores_by_candidate=objective_scores_by_candidate,
+            ticker_actions=ticker_actions_by_candidate.get(selected.candidate_id, []),
+            backtest_payload=_backtest_payload(
+                strategy_a,
+                rows,
+                benchmark_context=session.benchmark_context,
+            ),
+            feature_coverage=disclosed_coverage,
+            fallback_reasons=disclosed_reasons,
+            execution_stats={
+                **session.execution_stats(),
+                "candidates": diagnostics_by_candidate,
+            },
+        )
+        return _attach_walk_forward_artifact(result, len(candidates))
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _metric_coverage_disclosure(
+    store: PreparedFeatureStore,
+    candidate: CodeCandidate,
+    feature_coverage: Mapping[str, Any] | None,
+    fallback_reasons: Sequence[str] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Publish how usable each metric the rule reads actually was, and say when it wasn't.
+
+    The result itself is never withheld: the numbers are published as measured and this
+    only adds the missing sentence next to them - which metric was unavailable, and on
+    what share of the sessions - so a flat backtest can be read as "the data was not
+    there" rather than "the strategy did nothing".
+    """
+
+    coverage = rule_metric_coverage(store, candidate.strategy_ir)
+    merged = dict(feature_coverage or {})
+    if coverage:
+        merged["rule_metric_coverage"] = coverage
+    reasons = list(fallback_reasons or ())
+    for metric, share in sorted(coverage.items()):
+        if share >= MIN_DISCLOSED_METRIC_COVERAGE:
+            continue
+        reason = (
+            f"{metric} 지표는 분석 구간의 {share:.0%}에서만 값이 있었습니다 — "
+            "나머지 기간에는 이 조건이 신호를 낼 수 없었습니다."
+        )
+        if reason not in reasons:
+            reasons.append(reason)
+    return merged, reasons
+
+
+def _rows_for_sessions(
+    rows: Sequence[Mapping[str, Any]], sessions: Sequence[str]
+) -> list[Mapping[str, Any]]:
+    allowed = set(sessions)
+    return sorted(
+        (row for row in rows if str(row.get("date")) in allowed),
+        key=lambda row: (str(row.get("date")), str(row.get("ticker", ""))),
+    )
+
+
+def _fold_prepared_market(strategy: AIStrategySpec, engine_rows: Sequence[Mapping[str, Any]]):
+    """Engine market data for a fold, built once for every candidate that runs on it.
+
+    `prepare_market_data` reads the spec only through `required_metric_names`, and every
+    candidate spec here carries the same two generated-signal rules, so the result does
+    not vary by candidate - which is why the session already shares one prepared market
+    across the whole non-walk-forward run. Measured on production this and the row
+    conversion feeding it were 38% of a fold engine run.
+    """
+
+    ohlcv_rows, metric_rows = _engine_market_rows(engine_rows)
+    spec = _engine_strategy_spec(
+        strategy,
+        _FOLD_PREPARATION_CANDIDATE,
+        available_ticker_count=_available_ticker_count(engine_rows),
+        execution_capacity_enabled=_execution_capacity_enabled(engine_rows),
+    )
+    return prepare_engine_market_data(
+        spec,
+        ohlcv_rows=ohlcv_rows,
+        metric_rows=metric_rows,
+        config=EngineBacktestRunConfig(
+            initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+            write_outputs=False,
+            talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+            metrics_mode="selection",
+        ),
+        inputs_normalized=True,
+    )
+
+
+def _fold_engine(
+    strategy: AIStrategySpec,
+    candidate: CodeCandidate,
+    context_rows: Sequence[Mapping[str, Any]],
+    engine_rows: Sequence[Mapping[str, Any]],
+    tradable_sessions: set[str],
+    *,
+    store: PreparedFeatureStore | None = None,
+    prepared: EnginePreparedMarketData | None = None,
+):
+    store = store if store is not None else PreparedFeatureStore(context_rows, rows_are_sorted=True)
+    # The engine hands this fold a portfolio in cash on its first tradable session, so
+    # the generator's book restarts there too and treats it as a rotation day. Rows after
+    # the fold are never visited, which is also why no future bar can reach these
+    # decisions - the `tradable_sessions` gate below still blocks orders outside the fold.
+    ordered_tradable = sorted(tradable_sessions)
+    action_map = {
+        (str(row.get("date")), str(row.get("ticker", "")).zfill(6)): action
+        for row, action in zip(
+            store.rows,
+            store.build_actions(
+                candidate.strategy_ir,
+                candidate.parameters,
+                reset_session=ordered_tradable[0] if ordered_tradable else None,
+                stop_after_session=ordered_tradable[-1] if ordered_tradable else None,
+            ),
+            strict=True,
+        )
+    }
+    if prepared is None:
+        prepared = _fold_prepared_market(strategy, engine_rows)
+    actions = [
+        action_map.get((str(row.date), str(row.ticker).zfill(6)), HOLD_SIGNAL_VALUE)
+        if str(row.date) in tradable_sessions
+        else HOLD_SIGNAL_VALUE
+        for row in prepared.ohlcv_rows
+    ]
+    return _run_candidate_backtest(
+        strategy,
+        candidate,
+        engine_rows,
+        prepared_market=prepared,
+        generated_actions=actions,
+        metrics_mode="selection",
+    )
+
+
+def _fold_engine_outcome(
+    strategy: AIStrategySpec,
+    rows: Sequence[Mapping[str, Any]],
+    task: _FoldEngineTask,
+    prep: _FoldPrepCache,
+    store: PreparedFeatureStore,
+) -> _FoldEngineOutcome:
+    """One fold engine run, reduced to what the walk-forward aggregate reads.
+
+    The engine result never leaves this function: it carries the full equity curve and
+    order audit, and pickling those back from a worker costs more than the run itself.
+    `prep` is owned by whoever holds the rows, so a session tuple can only ever resolve
+    against the universe it was sliced from, and `store` is that same owner's
+    whole-window feature store.
+    """
+
+    prep.load(strategy, rows, task)
+    engine = _fold_engine(
+        strategy,
+        CodeCandidate.model_validate(task.candidate),
+        prep.engine_rows,
+        prep.engine_rows,
+        set(task.tradable_sessions),
+        store=store,
+        prepared=prep.prepared,
+    )
+    if not task.targets:
+        if not getattr(engine, "equity_curve", None):
+            return _FoldEngineOutcome()
+        return _FoldEngineOutcome(metrics=_metrics_from_engine_result(engine))
+    target_set = set(task.targets)
+    returns = _complete_target_returns(engine, target_set)
+    if returns is None:
+        return _FoldEngineOutcome()
+    return _FoldEngineOutcome(
+        returns=returns,
+        fills=tuple(_full_target_fills(engine, target_set)),
+        ledger=_storage_execution_ledger(engine),
+        closed_trade_pnl=_closed_trade_pnl(engine, target_set),
+    )
+
+
+def _complete_target_returns(engine_result: Any, targets: set[str]) -> dict[str, float] | None:
+    """Read every engine equity point; public curve sampling must never gate execution."""
+    returns: dict[str, float] = {}
+    for point in getattr(engine_result, "equity_curve", ()):
+        point_date = str(getattr(point, "date", ""))
+        if point_date in targets:
+            returns[point_date] = _finite_float(
+                getattr(point, "daily_return", None),
+                f"walk_forward_daily_return[{point_date}]",
+            )
+    return returns if set(returns) == targets else None
+
+
+def _closed_trade_pnl(engine_result: Any, targets: set[str]) -> tuple[float, ...]:
+    """Realized PnL of every round trip this fold closed inside its evaluation month."""
+
+    return tuple(
+        float(getattr(trade, "net_pnl", 0.0) or 0.0)
+        for trade in getattr(engine_result, "trades", ())
+        if str(getattr(trade, "exit_date", "")) in targets
+    )
+
+
+def _full_target_fills(engine_result: Any, targets: set[str]) -> list[dict[str, Any]]:
+    return [
+        payload
+        for event in getattr(engine_result, "order_audit", ())
+        if (payload := event.as_dict()).get("status") == "executed"
+        and str(payload.get("date", payload.get("session", ""))) in targets
+    ]
+
+
+def _walk_forward_win_rate(trade_pnl: Sequence[float]) -> float | None:
+    """Share of closed round trips that made money, or None when none closed.
+
+    The aggregate used to publish "share of days with a positive return" under the name
+    `win_rate`. Every session the portfolio sat in cash returns exactly 0.0 and counted
+    as a loss, so a run that was flat more than half the time reported a 19.8% win rate
+    and read as "loses eight trades out of ten". Fills are the only honest source.
+    """
+
+    return (sum(1 for value in trade_pnl if value > 0.0) / len(trade_pnl)) if trade_pnl else None
+
+
+def _positive_day_rate(returns: Sequence[float]) -> float:
+    """The old `win_rate` under its true name: share of sessions that gained."""
+
+    return (sum(1 for value in returns if value > 0.0) / len(returns)) if returns else 0.0
+
+
+def _walk_forward_aggregate_metrics(
+    returns: Sequence[float],
+    trade_pnl: Sequence[float] = (),
+    benchmark_returns: Sequence[float] = (),
+) -> BacktestMetrics:
+    total_return = _compound_returns(returns)
+    sharpe = _native_sharpe_like(list(returns))
+    win_rate = _walk_forward_win_rate(trade_pnl)
+    # Everything the walk-forward aggregate measures is out of sample, so the benchmark
+    # comparison it carries is the out-of-sample one. Without this the excess return was
+    # simply absent on every five-year run and the acceptance floor fell back to the
+    # candidate's own fitted window. `benchmark_returns` covers exactly the evaluation
+    # sessions the strategy returns above cover, so the two compound like with like.
+    benchmark_return = _compound_returns(benchmark_returns) if benchmark_returns else None
+    period_stats = (
+        _benchmark_period_stats(returns, benchmark_returns) if benchmark_returns else None
+    )
+    return BacktestMetrics(
+        sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
+        max_drawdown=round(_max_drawdown_from_returns(returns), METRIC_ROUND_DIGITS),
+        # `BacktestMetrics.win_rate` is a non-null float, so "not computable" is carried
+        # to the reader through `public_metric_availability`, not through this field.
+        win_rate=win_rate if win_rate is not None else 0.0,
+        total_return=round(total_return, METRIC_ROUND_DIGITS),
+        in_sample_sharpe=0.0,
+        out_sample_sharpe=round(sharpe, METRIC_ROUND_DIGITS),
+        degradation=0.0,
+        out_sample_return=round(total_return, METRIC_ROUND_DIGITS),
+        out_sample_benchmark_return=(
+            None if benchmark_return is None else round(benchmark_return, METRIC_ROUND_DIGITS)
+        ),
+        out_sample_excess_return=(
+            None
+            if benchmark_return is None
+            else round(total_return - benchmark_return, METRIC_ROUND_DIGITS)
+        ),
+        benchmark_period_count=None if period_stats is None else period_stats.count,
+        benchmark_period_win_rate=None if period_stats is None else period_stats.win_rate,
+        benchmark_period_loss_rate=None if period_stats is None else period_stats.loss_rate,
+        out_sample_benchmark_period_count=None if period_stats is None else period_stats.count,
+        out_sample_benchmark_period_win_rate=(
+            None if period_stats is None else period_stats.win_rate
+        ),
+        out_sample_benchmark_period_loss_rate=(
+            None if period_stats is None else period_stats.loss_rate
+        ),
+    )
+
+
+def _run_walk_forward_candidate_backtest(
+    strategy: AIStrategySpec,
+    candidates: list[CodeCandidate],
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    feature_coverage: Mapping[str, Any] | None,
+    fallback_reasons: Sequence[str] | None,
+    session: _CandidateBacktestSession,
+) -> CandidateBacktestResult:
+    if any(candidate.representation != "structured" for candidate in candidates):
+        result = run_candidate_backtest(
+            strategy,
+            candidates,
+            price_rows=rows,
+            feature_coverage=feature_coverage,
+            fallback_reasons=fallback_reasons,
+            _session=session,
+            _walk_forward_enabled=False,
+        )
+        masked = result.selected_candidate.model_copy(
+            update={
+                "metrics": _mask_unavailable_walk_forward_metrics(
+                    result.selected_candidate.metrics, UNSAFE_WALK_FORWARD_CANDIDATE
+                )
+            }
+        )
+        return _attach_walk_forward_artifact(
+            result.model_copy(
+                update={
+                    "selected_candidate": masked,
+                    "walk_forward": WalkForwardPolicyResult(
+                        status="unsafe_candidate",
+                        unavailable_reason=UNSAFE_WALK_FORWARD_CANDIDATE,
+                    ),
+                }
+            ),
+            len(candidates),
+        )
+
+    claimed: set[str] = set()
+    returns_by_session: dict[str, float] = {}
+    selections: list[WalkForwardFoldSelection] = []
+    fills: list[dict[str, Any]] = []
+    trade_pnl: list[float] = []
+    evaluation_ledgers: list[dict[str, Any]] = []
+    returns_by_candidate: dict[str, dict[str, float]] = {
+        candidate.candidate_id: {} for candidate in candidates
+    }
+    fills_by_candidate: dict[str, list[dict[str, Any]]] = {
+        candidate.candidate_id: [] for candidate in candidates
+    }
+    trade_pnl_by_candidate: dict[str, list[float]] = {
+        candidate.candidate_id: [] for candidate in candidates
+    }
+    folds_by_candidate: dict[str, int] = {candidate.candidate_id: 0 for candidate in candidates}
+    deduped = 0
+    selected: CodeCandidate | None = None
+    policy = _walk_forward_split_policy(rows)
+    tradable_candidates = [candidate for candidate in candidates if candidate.validation_ok]
+    # One dump and one identity per candidate, not one per fold per pass.
+    payloads = {
+        candidate.candidate_id: candidate.model_dump(mode="python")
+        for candidate in tradable_candidates
+    }
+    identities = {
+        candidate.candidate_id: _candidate_identity(candidate) for candidate in tradable_candidates
+    }
+    for fold in policy.folds:
+        # Rolling evaluation is the one stretch of this node with no round boundary in
+        # it: a wide window runs every fold back to back. Check at the fold boundary so
+        # a cancel or an expired request deadline is honoured within a fold's cost
+        # instead of after the whole walk-forward.
+        raise_if_cancelled()
+        raise_if_past_deadline()
+        selection_sessions = (
+            *fold.warmup_sessions,
+            *fold.train_sessions,
+            *fold.validation_sessions,
+        )
+        # Selection engine sees warmup for features, but warmup orders are HOLD.
+        selection_tradable = (*fold.train_sessions, *fold.validation_sessions)
+        selection_outcomes = session.run_fold_engines(
+            [
+                (
+                    ("select", identities[proposed.candidate_id], fold.fold_index),
+                    _FoldEngineTask(
+                        candidate=payloads[proposed.candidate_id],
+                        engine_sessions=selection_sessions,
+                        tradable_sessions=selection_tradable,
+                    ),
+                )
+                for proposed in tradable_candidates
+            ]
+        )
+        eligible = [
+            proposed.model_copy(update={"metrics": outcome.metrics})
+            for proposed, outcome in zip(tradable_candidates, selection_outcomes, strict=True)
+            if outcome.metrics is not None
+        ]
+        if not eligible:
+            continue
+        own = [candidate for candidate in eligible if _is_user_rule(candidate)]
+        candidate = max(own or eligible, key=_candidate_rank)
+
+        targets = tuple(session for session in fold.evaluation_sessions if session not in claimed)
+        deduped += len(fold.evaluation_sessions) - len(targets)
+        if not targets:
+            continue
+        target_set = set(targets)
+        evaluation_outcomes = session.run_fold_engines(
+            [
+                (
+                    ("evaluate", identities[proposed.candidate_id], fold.fold_index, targets),
+                    _FoldEngineTask(
+                        candidate=payloads[proposed.candidate_id],
+                        # Fresh engine gets bridge + target only; actions retain all
+                        # causal feature history.
+                        engine_sessions=(*fold.validation_sessions[-1:], *targets),
+                        tradable_sessions=targets,
+                        targets=targets,
+                    ),
+                )
+                for proposed in tradable_candidates
+            ]
+        )
+        fold_results = {
+            proposed.candidate_id: outcome
+            for proposed, outcome in zip(tradable_candidates, evaluation_outcomes, strict=True)
+            if outcome.returns is not None
+        }
+        selected_result = fold_results.get(candidate.candidate_id)
+        if selected_result is None:
+            continue
+        claimed.update(target_set)
+        returns_by_session.update(selected_result.returns or {})
+        fills.extend(selected_result.fills)
+        trade_pnl.extend(selected_result.closed_trade_pnl)
+        if selected_result.ledger is not None:
+            evaluation_ledgers.append(selected_result.ledger)
+        for candidate_id, outcome in fold_results.items():
+            returns_by_candidate[candidate_id].update(outcome.returns or {})
+            fills_by_candidate[candidate_id].extend(outcome.fills)
+            trade_pnl_by_candidate[candidate_id].extend(outcome.closed_trade_pnl)
+            folds_by_candidate[candidate_id] += 1
+        selected = candidate
+        digest = sha256(
+            json.dumps(
+                {
+                    "fold": fold.fold_index,
+                    "candidate": _candidate_identity(candidate),
+                    "train": fold.train_sessions,
+                    "validation": fold.validation_sessions,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        selections.append(
+            WalkForwardFoldSelection(
+                fold_index=fold.fold_index,
+                selection_hash=digest,
+                candidate_id=candidate.candidate_id,
+                evaluation_sessions=list(targets),
+            )
+        )
+
+    months = {session[:7] for session in returns_by_session}
+    window = policy.walk_forward
+    ready = (
+        len(selections) >= window.min_valid_folds
+        and len(months) >= window.min_unique_evaluation_months
+        and len(returns_by_session) >= window.min_unique_evaluation_sessions
+        and len(returns_by_session) == len(claimed)
+    )
+    ordered_sessions = sorted(returns_by_session) if ready else []
+    daily_returns = {session: returns_by_session[session] for session in ordered_sessions}
+    equity = 1.0
+    curve: list[BacktestEquityPoint] = []
+    for evaluation_session in ordered_sessions:
+        equity *= 1.0 + daily_returns[evaluation_session]
+        curve.append(
+            BacktestEquityPoint(
+                date=evaluation_session, cumulative_return=round(equity - 1.0, METRIC_ROUND_DIGITS)
+            )
+        )
+    if selected is None:
+        raise ValueError("walk-forward produced no complete evaluation fold")
+    # Today's per-stock verdict, which the folds cannot supply: they are memoized down to
+    # metrics/returns/fills/ledger, so no engine result with last-bar signals survives
+    # them and every researched run published `ticker_actions: 0`. One full-window run of
+    # the *selected* rule - the same rule the folds validated - is the cheapest faithful
+    # source. Performance stays the out-of-sample aggregate; only the verdict comes from
+    # here. A verdict that cannot be produced must not void an otherwise complete run.
+    try:
+        ticker_actions = session.evaluate([selected])[0].ticker_actions
+    except AnalysisCancelled:
+        raise
+    except Exception:  # noqa: BLE001 - display-only; the walk-forward result stands.
+        ticker_actions = []
+    costs = sum(
+        sum(
+            float(fill.get(key, 0.0) or 0.0)
+            for key in ("commission_cost", "tax_cost", "slippage_cost")
+        )
+        for fill in fills
+    )
+    aggregate_metrics = (
+        _walk_forward_aggregate_metrics(
+            list(daily_returns.values()),
+            trade_pnl,
+            benchmark_daily_returns_for_sessions(session.benchmark_context, ordered_sessions),
+        )
+        if ready
+        else None
+    )
+    engine_summaries_by_candidate: dict[str, dict[str, Any]] = {}
+    for proposed in candidates:
+        candidate_returns = returns_by_candidate[proposed.candidate_id]
+        candidate_months = {session[:7] for session in candidate_returns}
+        candidate_ready = bool(
+            folds_by_candidate[proposed.candidate_id] >= window.min_valid_folds
+            and len(candidate_months) >= window.min_unique_evaluation_months
+            and len(candidate_returns) >= window.min_unique_evaluation_sessions
+            and len(candidate_returns) == len(claimed)
+        )
+        candidate_fills = fills_by_candidate[proposed.candidate_id]
+        candidate_costs = sum(
+            sum(
+                float(fill.get(key, 0.0) or 0.0)
+                for key in ("commission_cost", "tax_cost", "slippage_cost")
+            )
+            for fill in candidate_fills
+        )
+        candidate_sessions = sorted(candidate_returns)
+        candidate_metrics = (
+            _walk_forward_aggregate_metrics(
+                [candidate_returns[item] for item in candidate_sessions],
+                trade_pnl_by_candidate[proposed.candidate_id],
+                benchmark_daily_returns_for_sessions(session.benchmark_context, candidate_sessions),
+            )
+            if candidate_ready
+            else None
+        )
+        engine_summaries_by_candidate[proposed.candidate_id] = {
+            "walk_forward_policy": "rolling_selection_policy",
+            "aggregate_oos_result": (
+                {
+                    "availability": "available",
+                    "total_return": candidate_metrics.out_sample_return,
+                    "sharpe_ratio": candidate_metrics.out_sample_sharpe,
+                    "max_drawdown": candidate_metrics.max_drawdown,
+                    "evaluation_session_count": len(candidate_returns),
+                    "trade_count": len(candidate_fills),
+                    "costs": candidate_costs,
+                    "after_costs": True,
+                }
+                if candidate_metrics is not None
+                else {
+                    "availability": ("unavailable" if proposed.validation_ok else "failed"),
+                    "reason": (
+                        INSUFFICIENT_WALK_FORWARD_SAMPLE
+                        if proposed.validation_ok
+                        else "candidate_validation_failed"
+                    ),
+                    "evaluation_session_count": len(candidate_returns),
+                    "trade_count": len(candidate_fills),
+                    "costs": candidate_costs,
+                    "after_costs": True,
+                }
+            ),
+        }
+    execution_capacity_enabled = _execution_capacity_enabled(rows)
+    executed_buy_count = sum(1 for fill in fills if str(fill.get("side")) == "buy")
+    # Walk-forward has no single in-sample block - selection ran per fold on that fold's
+    # own train/validation - so `in_sample_sharpe` and the degradation derived from it
+    # are pinned at 0.0 by construction. Published as 0.0 they read as "no overfitting
+    # decay at all", which is a claim nothing measured. The numbers are still published
+    # everywhere else; only these two say why they are absent.
+    walk_forward_availability: dict[str, dict[str, Any]] = {
+        "in_sample_sharpe": {
+            "value": None,
+            "unavailable_reason": WALK_FORWARD_HAS_NO_IN_SAMPLE_BLOCK,
+        },
+        "degradation": {
+            "value": None,
+            "unavailable_reason": WALK_FORWARD_HAS_NO_IN_SAMPLE_BLOCK,
+        },
+    }
+    if ready and not trade_pnl:
+        walk_forward_availability["win_rate"] = {
+            "value": None,
+            "unavailable_reason": NO_CLOSED_TRADE_WIN_RATE,
+        }
+    engine_summary = {
+        "walk_forward_sample": _walk_forward_metadata(_walk_forward_sample(rows), policy),
+        "walk_forward_policy": "rolling_selection_policy",
+        "initial_capital": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+        "execution_timing": "next_open",
+        "cost_model": {
+            "commission_pct": float(
+                strategy.risk_constraints.get("commission_pct", DEFAULT_COMMISSION_PCT)
+            ),
+            "tax_pct": float(strategy.risk_constraints.get("tax_pct", DEFAULT_TAX_PCT)),
+            "slippage_pct": float(
+                strategy.risk_constraints.get("slippage_pct", DEFAULT_SLIPPAGE_PCT)
+            ),
+        },
+        # Positions opened, the same definition the single-pass path publishes. This
+        # counted both order legs, so the same run reported 445 trades here and 371
+        # there; a user comparing a one-year and a five-year answer saw two different
+        # units under one label. Both legs stay visible as `filled_order_legs`.
+        "effective_trade_count": executed_buy_count,
+        "filled_order_legs": len(fills),
+        "executed_sell_count": len(fills) - executed_buy_count,
+        "closed_trade_count": len(trade_pnl),
+        # The old `win_rate`, kept under a name that says what it measures.
+        "positive_day_rate": round(
+            _positive_day_rate(list(daily_returns.values())), METRIC_ROUND_DIGITS
+        ),
+        "public_metric_availability": walk_forward_availability,
+        "execution_capacity": _execution_capacity_metadata(execution_capacity_enabled),
+        "_storage_execution_ledger": _merge_storage_execution_ledgers(evaluation_ledgers),
+    }
+    engine_summary["performance_method_manifest"] = _performance_method_manifest(
+        strategy,
+        selected,
+        rows,
+        engine_summary,
+    )
+    walk_forward_coverage, walk_forward_reasons = _metric_coverage_disclosure(
+        session.feature_store, selected, feature_coverage, fallback_reasons
+    )
+    result = CandidateBacktestResult(
+        strategy_a=strategy,
+        candidates=candidates,
+        selected_candidate=selected,
+        equity_curve=curve,
+        ticker_actions=ticker_actions,
+        engine_summary=engine_summary,
+        engine_summaries_by_candidate=engine_summaries_by_candidate,
+        backtest_payload=_backtest_payload(
+            strategy,
+            rows,
+            benchmark_context=session.benchmark_context,
+        ),
+        feature_coverage=walk_forward_coverage,
+        fallback_reasons=walk_forward_reasons,
+        execution_stats={
+            **session.execution_stats(),
+            "walk_forward": True,
+            "evaluation_sessions": len(claimed),
+        },
+        walk_forward=WalkForwardPolicyResult(
+            status="ready" if ready else "insufficient",
+            unavailable_reason=None if ready else INSUFFICIENT_WALK_FORWARD_SAMPLE,
+            fold_selections=selections,
+            unique_evaluation_session_count=len(daily_returns),
+            daily_returns=daily_returns,
+            aggregate_metrics=aggregate_metrics,
+            equity_curve=curve,
+            fills=fills if ready else [],
+            costs=costs if ready else 0.0,
+            deduped_session_count=deduped,
+        ),
+    )
+    return _attach_walk_forward_artifact(result, len(candidates))
+
+
+def backtest_node(state: dict[str, Any]) -> dict[str, Any]:
+    node_started = time.perf_counter()
+    strategy_a = AIStrategySpec.model_validate(state["strategy_spec"])
+    candidates = [
+        CodeCandidate.model_validate(candidate)
+        for candidate in state["backtest_code"]["candidates"]
+    ]
+    price_rows = state["price_rows"] if "price_rows" in state else state.get("market_prices")
+    rows = _price_rows(price_rows)
+    ticker_count = _available_ticker_count(rows)
+    max_positions = _applied_max_positions(strategy_a, ticker_count)
+
+    # Backtesting is pure computation with no provider stream behind it, so without
+    # these the live view has nothing to show for the minutes this node runs.
+    report_activity(
+        "step",
+        label=f"백테스트 실행 · 후보 {len(candidates)}개",
+        detail=f"종목 {ticker_count}개 · 최대 보유 {max_positions}종목",
+    )
+    if ticker_count < MIN_RELIABLE_TICKERS:
+        # A backtest over a handful of names measures those names, not the strategy - the
+        # result rides on their idiosyncratic history and does not generalise. Say so
+        # rather than presenting a two-stock curve as if it validated the rule.
+        report_activity(
+            "step",
+            label="표본 부족 경고",
+            detail=(
+                f"조건에 맞는 종목이 {ticker_count}개뿐이라 백테스트 신뢰도가 낮습니다. "
+                "결과는 이 종목들의 과거에 크게 좌우됩니다."
+            ),
+        )
+    with _CandidateBacktestSession(
+        strategy_a,
+        rows,
+        official_benchmark=state.get("official_benchmark"),
+    ) as session:
+        result = run_candidate_backtest(
+            strategy_a,
+            candidates,
+            price_rows=rows,
+            feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
+            fallback_reasons=state.get("backtest_code", {}).get("fallback_reasons", []),
+            _session=session,
+        )
+        report_activity(
+            "step",
+            label="백테스트 1차 완료",
+            detail=_selected_candidate_detail(result),
+        )
+        all_candidates = candidates
+        campaign = ResearchCampaign.start(
+            {_candidate_identity(candidate) for candidate in all_candidates}
+        )
+        fallback_reasons = list(state.get("backtest_code", {}).get("fallback_reasons", []))
+        # Refinement operates only on the selection data: candidates are still chosen
+        # per fold on train/validation, so re-running the walk-forward with a wider set
+        # keeps the evaluation out of sample. It used to be skipped entirely once
+        # walk-forward was READY, which meant a run that missed the acceptance floor
+        # stopped at the first pass and reported the miss instead of trying to clear it.
+        # Each extra round widens the search, and `candidate_count` prices that in.
+        self_improvement_rounds = campaign.budget.max_rounds
+        rounds_run = 0
+        # A round now only evaluates the candidates it adds - `session.run_fold_engines`
+        # memoises every (candidate, fold) pair - and spreads them over the worker pool,
+        # so its cost is the marginal per-candidate cost, not the whole set again.
+        # Starting a round that cannot finish inside the budget doubled a 34s live run
+        # to 76s, so the projection still has to be there.
+        per_candidate_seconds = (
+            (time.perf_counter() - node_started)
+            / max(1, len(all_candidates))
+            / _fold_worker_count(SELF_IMPROVEMENT_CANDIDATES_PER_ROUND)
+        )
+        result = _apply_selection_correction(result, len(all_candidates))
+        floor_reasons = objective_floor_reasons(result)
+        if not floor_reasons:
+            campaign.stop("objective_target_reached")
+        while floor_reasons and campaign.allow_next_round():
+            iteration = campaign.rounds_started + 1
+            # The request-wide ceiling is checked here too, not only at node boundaries:
+            # a self-improvement round can run for minutes, and stopping between rounds
+            # keeps the candidates already evaluated instead of losing the node's work.
+            raise_if_past_deadline()
+            remaining = _wall_budget_seconds() - (time.perf_counter() - node_started)
+            projected = per_candidate_seconds * SELF_IMPROVEMENT_CANDIDATES_PER_ROUND
+            if projected > remaining:
+                campaign.stop("wall_budget_insufficient")
+                fallback_reasons.append(
+                    f"research campaign stopped: projected {projected:.1f}s round does not "
+                    f"fit the {remaining:.1f}s left of the {_wall_budget_seconds():g}s wall budget"
+                )
+                break
+            proposed = generate_self_improvement_candidates(
+                strategy_a,
+                state.get("backtest_code", {}).get("code_plan", {}),
+                start_index=len(all_candidates) + 1,
+                iteration=iteration,
+                max_positions=max_positions,
+            )
+            admitted_identities = set(
+                campaign.admit_candidate_identities(
+                    [_candidate_identity(candidate) for candidate in proposed]
+                )
+            )
+            improved = [
+                candidate
+                for candidate in proposed
+                if _candidate_identity(candidate) in admitted_identities
+            ]
+            if not improved:
+                campaign.stop(campaign.stop_reason or "no_distinct_candidates")
+                fallback_reasons.append(
+                    f"research campaign iteration {iteration}: no distinct candidates"
+                )
+                break
+            all_candidates = [*all_candidates, *improved]
+            fallback_reasons.append(
+                f"self-improvement iteration {iteration}: generated {len(improved)} threshold-adjusted candidates"
+            )
+            report_activity(
+                "step",
+                label=f"목표 미달 · 자가개선 {iteration}차",
+                detail=f"신규 임계값 조정 후보 {len(improved)}개 평가 (누적 {len(all_candidates)}개)",
+            )
+            round_started = time.perf_counter()
+            next_result = run_candidate_backtest(
+                strategy_a,
+                all_candidates,
+                price_rows=rows,
+                feature_coverage=state.get("backtest_code", {}).get("feature_mapping", {}),
+                fallback_reasons=fallback_reasons,
+                _session=session,
+            )
+            rounds_run = iteration
+            # The first-pass estimate carries one-off session setup and the first pass's
+            # own parallelism. Once a round has actually run, price the next one off it.
+            per_candidate_seconds = (time.perf_counter() - round_started) / len(improved)
+            next_result = _apply_selection_correction(next_result, len(all_candidates))
+            next_reasons = objective_floor_reasons(next_result)
+            # Keep the round that clears the floor, or the one that scores better on the
+            # selection data. Ranking rounds by their out-of-sample result would be a
+            # second argmax over the evaluation period, which is the bias this node
+            # spends the deflation term correcting.
+            previous_score = _selected_objective_score(result)
+            next_score = _selected_objective_score(next_result)
+            campaign_improved = campaign.record_round(
+                proposed_count=len(proposed),
+                admitted_count=len(improved),
+                score_before=previous_score,
+                score_after=next_score,
+                progress=not next_reasons or next_score > previous_score,
+            )
+            if campaign_improved:
+                result = next_result
+                floor_reasons = next_reasons
+                report_activity(
+                    "step",
+                    label=f"자가개선 {iteration}차 완료",
+                    detail=_selected_candidate_detail(result),
+                )
+            else:
+                report_activity(
+                    "step",
+                    label=f"자가개선 {iteration}차 · 개선 없음",
+                    detail="선택 구간에서 개선은 없었습니다. 남은 리서치 예산을 확인합니다.",
+                )
+        if not floor_reasons:
+            campaign.stop("objective_target_reached", replace=True)
+        # The winner was chosen by argmax over every candidate tried, so its in-sample
+        # numbers carry the bias of that search. N is only known here - the per-candidate
+        # evaluations are cached and must not depend on how many siblings they had.
+        result = _apply_selection_correction(result, len(all_candidates))
+        result = result.model_copy(
+            update={
+                "fallback_reasons": fallback_reasons,
+                "generated_strategy_blueprints": list(
+                    state.get("backtest_code", {})
+                    .get("code_plan", {})
+                    .get("generated_strategies", [])
+                ),
+                "execution_stats": {
+                    **result.execution_stats,
+                    **session.execution_stats(),
+                    "total_backtest_wall_seconds": round(time.perf_counter() - node_started, 6),
+                    "configured_workers": _configured_worker_limit(),
+                    "candidate_timeout_seconds": _candidate_timeout_seconds(),
+                    "wall_budget_seconds": _wall_budget_seconds(),
+                    "selection_policy": (
+                        "performance_momentum_train_select_holdout_validate"
+                        if strategy_a.selection_mode == "automatic"
+                        else "bounded_candidate_refinement"
+                    ),
+                    "self_improvement_rounds_limit": self_improvement_rounds,
+                    "self_improvement_rounds_run": rounds_run,
+                    "research_campaign": campaign.manifest(),
+                },
+            }
+        )
+    # The recommendation gate downstream needs to know whether this strategy's backtest
+    # actually cleared the objective floor, not just what its metrics were.
+    floor_reasons = objective_floor_reasons(result)
+    return {
+        "backtest": result.model_dump(),
+        "strategy_validated": _passes_objective_floor(result),
+        # Published whether or not the floor is enforcing, so the reader can see what the
+        # acceptance check actually concluded rather than only its effect. The reader
+        # gets a verdict in both cases - which candidate cleared it, or the numbers that
+        # missed and by how much - never a blank section.
+        "objective_floor": {
+            "mode": validation_gate_mode(),
+            "cleared": not floor_reasons,
+            "reasons": floor_reasons,
+            "rounds_run": rounds_run,
+            "candidates_tried": len(all_candidates),
+            "metrics": _floor_metric_summary(result),
+            "conclusion": _objective_floor_conclusion(
+                result,
+                reasons=floor_reasons,
+                rounds_run=rounds_run,
+                candidates_tried=len(all_candidates),
+            ),
+        },
+    }
+
+
+def _apply_selection_correction(
+    result: CandidateBacktestResult, candidate_count: int
+) -> CandidateBacktestResult:
+    """Record how wide the search was, and deflate the winner's Sharpe for it.
+
+    Nothing about the run changes - the same candidate stays selected. What changes is
+    that the headline now carries the size of the search that produced it, so an argmax
+    over fifteen tries cannot be read as one strategy that happened to work.
+    """
+
+    metrics = result.selected_candidate.metrics
+    if metrics is None:
+        return result
+    walk_forward = getattr(result, "walk_forward", None)
+    aggregate = _ready_aggregate_metrics(result)
+    if aggregate is not None and aggregate.out_sample_sharpe is not None:
+        # Walk-forward has no in-sample Sharpe to deflate: `_walk_forward_aggregate_metrics`
+        # sets it to 0.0 because selection happened per fold on train/validation only.
+        # Subtracting the argmax bias from that zero produced a large negative number
+        # (measured: -2.84 on a one-year live run) that failed the floor structurally,
+        # whatever the strategy did. The number carrying the search bias here is the
+        # rolling out-of-sample aggregate, over the sessions it was measured on.
+        base = aggregate.out_sample_sharpe
+        observations = max(1, walk_forward.unique_evaluation_session_count)
+    else:
+        base = metrics.in_sample_sharpe
+        observations = max(1, metrics.in_sample_observations)
+    correction = {
+        "candidates_evaluated": max(1, candidate_count),
+        "selection_adjusted_sharpe": round(
+            base - _expected_max_sharpe(candidate_count, observations),
+            METRIC_ROUND_DIGITS,
+        ),
+    }
+    update: dict[str, Any] = {
+        "selected_candidate": result.selected_candidate.model_copy(
+            update={"metrics": metrics.model_copy(update=correction)}
+        )
+    }
+    if aggregate is not None:
+        # The public performance document reads the aggregate, so the search width has
+        # to be on it too - otherwise the headline says candidates_evaluated=1.
+        update["walk_forward"] = walk_forward.model_copy(
+            update={"aggregate_metrics": aggregate.model_copy(update=correction)}
+        )
+    return result.model_copy(update=update)
+
+
+def _ready_aggregate_metrics(result: CandidateBacktestResult) -> BacktestMetrics | None:
+    walk_forward = getattr(result, "walk_forward", None)
+    if walk_forward is None or getattr(walk_forward, "status", None) != "ready":
+        return None
+    return walk_forward.aggregate_metrics
+
+
+def _selected_candidate_detail(result: CandidateBacktestResult) -> str:
+    parts = [f"선택 후보 {result.selected_candidate.candidate_id}"]
+    score = _selected_objective_score(result)
+    if math.isfinite(score):
+        parts.append(f"목표점수 {score:.3f}")
+    if result.equity_curve:
+        parts.append(f"누적수익 {result.equity_curve[-1].cumulative_return:.2%}")
+    return " · ".join(parts)
+
+
+def _run_candidate_backtest(
+    strategy: AIStrategySpec,
+    candidate: CodeCandidate,
+    price_rows: Sequence[Mapping[str, Any]],
+    *,
+    prepared_market: EnginePreparedMarketData,
+    generated_actions: Sequence[int] | None,
+    generated_scores: Sequence[float] | None = None,
+    metrics_mode: str,
+):
+    actions = generated_actions
+    scores = generated_scores
+    if actions is None:
+        generated_signals = _execute_candidate_code(candidate, price_rows)
+        actions, scores = _compact_actions_from_signals(prepared_market, generated_signals)
+    engine_spec = _engine_strategy_spec(
+        strategy,
+        candidate,
+        available_ticker_count=_available_ticker_count(price_rows),
+        execution_capacity_enabled=_execution_capacity_enabled(price_rows),
+    )
+    return run_engine_backtest(
+        engine_spec,
+        config=EngineBacktestRunConfig(
+            initial_capital=CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+            write_outputs=False,
+            talib=EngineTalibIndicatorConfig(enabled=False, mode="none"),
+            metrics_mode=metrics_mode,
+        ),
+        prepared_market_data=prepared_market,
+        generated_actions=actions,
+        generated_scores=scores,
+    )
+
+
+def _compact_actions_from_signals(
+    prepared_market: EnginePreparedMarketData,
+    generated_signals: Sequence[GeneratedSignal],
+) -> tuple[list[int], list[float]]:
+    actions = [0] * len(prepared_market.ohlcv_rows)
+    scores = [float("nan")] * len(prepared_market.ohlcv_rows)
+    tickers_by_date: dict[str, list[str]] = {}
+    for bar in prepared_market.ohlcv_rows:
+        tickers_by_date.setdefault(bar.date.isoformat(), []).append(bar.ticker)
+    for signal in generated_signals:
+        ticker = signal.ticker
+        if ticker is None:
+            tickers = tickers_by_date.get(signal.date, [])
+            if len(tickers) != 1:
+                raise ValueError(f"generated signal date {signal.date} is ambiguous without ticker")
+            ticker = tickers[0]
+        key = (date.fromisoformat(signal.date), ticker)
+        index = prepared_market.row_index_by_key.get(key)
+        if index is None:
+            raise ValueError(
+                f"generated signal {signal.date}/{ticker} is not present in price rows"
+            )
+        actions[index] = int(SIGNAL_METRIC_VALUES[signal.action])
+        if signal.action == "BUY" and signal.score is not None:
+            scores[index] = float(signal.score)
+    return actions, scores
+
+
+def _execute_candidate_code(
+    candidate: CodeCandidate, price_rows: Sequence[Mapping[str, Any]]
+) -> list[GeneratedSignal]:
+    """Run legacy generated Python in a short-lived child process.
+
+    Structured candidates never reach this function.  It only preserves backward
+    compatibility for a legacy provider response while keeping `exec()` out of
+    the API process and the long-lived backtest worker.  The child returns a JSON
+    payload, not a pickled object, because the executed code must not be able to
+    trigger deserialization in its parent.
+    """
+
+    validation = validate_backtest_code(candidate.code)
+    validation.raise_for_violations()
+    context = get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_candidate_code_worker,
+        args=(sender, candidate.code, [dict(row) for row in price_rows]),
+        name="quantagent-candidate-sandbox",
+    )
+    process.start()
+    sender.close()
+    timeout_seconds = _candidate_timeout_seconds()
+    try:
+        if not receiver.poll(timeout_seconds):
+            process.terminate()
+            process.join(timeout=1)
+            raise IsolatedCandidateCodeError(
+                f"candidate {candidate.candidate_id} exceeded {timeout_seconds:g}s isolated-code timeout"
+            )
+        try:
+            response = json.loads(receiver.recv_bytes().decode("utf-8"))
+        except (EOFError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise IsolatedCandidateCodeError(
+                f"candidate {candidate.candidate_id} isolated-code process returned no valid result"
+            ) from exc
+    finally:
+        receiver.close()
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=1)
+
+    if not isinstance(response, Mapping) or response.get("ok") is not True:
+        raise IsolatedCandidateCodeError(
+            f"candidate {candidate.candidate_id} failed in isolated-code process"
+        )
+    raw_signals = response.get("signals")
+    if not isinstance(raw_signals, list):
+        raise IsolatedCandidateCodeError(
+            f"candidate {candidate.candidate_id} isolated-code process returned invalid signals"
+        )
+    return [_generated_signal_from_raw(signal) for signal in raw_signals]
+
+
+def _candidate_code_worker(connection: Any, code: str, price_rows: list[dict[str, Any]]) -> None:
+    """Child-only executor for legacy candidate code; never send pickle to the parent."""
+
+    payload: dict[str, object]
+    try:
+        namespace: dict[str, Any] = {}
+        exec(code, {"__builtins__": _safe_builtins()}, namespace)
+        build_signals = namespace.get("build_signals")
+        if not callable(build_signals):
+            raise TypeError("build_signals is not callable")
+        raw_signals = build_signals(price_rows)
+        if not isinstance(raw_signals, Sequence):
+            raise TypeError("build_signals did not return a signal sequence")
+        payload = {
+            "ok": True,
+            "signals": [
+                _generated_signal_from_raw(signal).model_dump(mode="json") for signal in raw_signals
+            ],
+        }
+    except BaseException:
+        # The detail can contain code/provider text, so it must not leave the
+        # sandbox.  The parent emits one generic, safe execution failure instead.
+        payload = {"ok": False}
+    try:
+        connection.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    finally:
+        connection.close()
+
+
+def _storage_execution_ledger(engine_result: Any) -> dict[str, Any]:
+    signals = [signal.as_dict() for signal in getattr(engine_result, "signals", [])]
+    order_audit = [event.as_dict() for event in getattr(engine_result, "order_audit", [])]
+    fills = [event for event in order_audit if event.get("status") == "executed"]
+    trades = [trade.as_dict() for trade in getattr(engine_result, "trades", [])]
+    positions: list[dict[str, Any]] = []
+    quantities: dict[str, float] = defaultdict(float)
+    for fill in fills:
+        ticker = str(fill.get("ticker") or "")
+        quantity = float(fill.get("filled_quantity") or 0)
+        quantities[ticker] += quantity if fill.get("side") == "buy" else -quantity
+        positions.append(
+            {
+                "date": fill.get("date"),
+                "ticker": ticker,
+                "quantity": quantities[ticker],
+                "fill_quantity": quantity,
+                "side": fill.get("side"),
+                "reason": fill.get("reason"),
+            }
+        )
+    equity = [point.as_dict() for point in getattr(engine_result, "equity_curve", [])]
+    ledger = {
+        "signals": signals,
+        "order_audit": order_audit,
+        "fills": fills,
+        "positions": positions,
+        "trades": trades,
+        "equity": equity,
+    }
+    ledger["source_event_count"] = sum(
+        len(value) for value in ledger.values() if isinstance(value, list)
+    )
+    ledger["source_event_hash"] = sha256(
+        json.dumps(
+            {
+                key: ledger[key]
+                for key in ("signals", "order_audit", "fills", "positions", "trades", "equity")
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return ledger
+
+
+def _merge_storage_execution_ledgers(
+    ledgers: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    keys = ("signals", "order_audit", "fills", "positions", "trades", "equity")
+    merged: dict[str, Any] = {key: [] for key in keys}
+    for ledger in ledgers:
+        for key in keys:
+            records = ledger.get(key, [])
+            if isinstance(records, list):
+                merged[key].extend(records)
+    merged["source_event_count"] = sum(len(merged[key]) for key in keys)
+    merged["source_event_hash"] = sha256(
+        json.dumps(
+            {key: merged[key] for key in keys},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return merged
+
+
+def _generated_signal_from_raw(signal: object) -> GeneratedSignal:
+    if isinstance(signal, Mapping):
+        normalized = dict(signal)
+        action = normalized.get("action")
+        if isinstance(action, str):
+            normalized["action"] = action.upper()
+        ticker = normalized.get("ticker")
+        if ticker is not None:
+            normalized["ticker"] = str(ticker).zfill(6)
+        return GeneratedSignal.model_validate(normalized)
+    return GeneratedSignal.model_validate(signal)
+
+
+def _engine_market_rows(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[Any], dict[tuple[date, str], dict[str, float]]]:
+    ohlcv_rows: list[Any] = []
+    metric_rows: dict[tuple[date, str], dict[str, float]] = {}
+
+    raw_execution_declared = any(
+        any(
+            field in row for field in ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume")
+        )
+        for row in price_rows
+    )
+    for raw in price_rows:
+        if "date" not in raw or "close" not in raw:
+            raise ValueError(
+                "price rows must include date and adjusted close for signal generation"
+            )
+        row_date = date.fromisoformat(str(raw["date"]))
+        ticker = str(raw.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        if raw_execution_declared:
+            required_raw_fields = ("raw_open", "raw_high", "raw_low", "raw_close", "raw_volume")
+            missing = [field for field in required_raw_fields if raw.get(field) in (None, "")]
+            if missing:
+                raise ValueError(
+                    f"raw_execution_unavailable:{row_date.isoformat()}/{ticker}:{','.join(missing)}"
+                )
+            open_price = _finite_float(raw["raw_open"], "raw_open")
+            high = _finite_float(raw["raw_high"], "raw_high")
+            low = _finite_float(raw["raw_low"], "raw_low")
+            close = _finite_float(raw["raw_close"], "raw_close")
+            volume = _finite_float(raw["raw_volume"], "raw_volume")
+            raw_notional = raw.get("raw_notional")
+            parsed_raw_notional = (
+                None if raw_notional in (None, "") else _finite_float(raw_notional, "raw_notional")
+            )
+        else:
+            # Price-only V3 plans explicitly use the official adjusted OHLCV series for
+            # both signals and fills.  That is a source-backed execution basis, not a
+            # fabricated raw quote; raw notional remains absent so capacity is not
+            # claimed. Legacy fixture callers without a basis retain their historical
+            # self-consistent fallback.
+            close = _finite_float(raw["close"], "close")
+            open_price = _finite_float(raw.get("open", close), "open")
+            high = _finite_float(raw.get("high", max(open_price, close)), "high")
+            low = _finite_float(raw.get("low", min(open_price, close)), "low")
+            volume = _finite_float(raw.get("volume", DEFAULT_FIXTURE_VOLUME), "volume")
+            raw_notional = raw.get("raw_notional")
+            parsed_raw_notional = (
+                None if raw_notional in (None, "") else _finite_float(raw_notional, "raw_notional")
+            )
+        ohlcv_rows.append(
+            EngineOhlcvBar(
+                date=row_date,
+                ticker=ticker,
+                name=str(raw.get("name") or ""),
+                market=str(raw.get("market") or DEFAULT_FIXTURE_MARKET),
+                open=open_price,
+                high=high,
+                low=low,
+                close=close,
+                volume=volume,
+                raw_notional=parsed_raw_notional,
+            )
+        )
+        metric_row: dict[str, float] = {}
+        for key, value in raw.items():
+            if str(key) in PRICE_FIELD_NAMES or not _is_numeric_metric(value):
+                continue
+            metric_row[str(key)] = float(value)
+        metric_rows[(row_date, ticker)] = metric_row
+
+    return ohlcv_rows, metric_rows
+
+
+def _execution_capacity_enabled(price_rows: Sequence[Mapping[str, Any]]) -> bool:
+    """Require source-provided traded value before claiming fill capacity.
+
+    Raw OHLCV supports a costed next-open backtest. Raw traded value supports the
+    additional participation-capacity constraint. When it is absent, leave it absent
+    and disable only that constraint rather than creating a false close × volume value.
+    """
+
+    return bool(price_rows) and all(row.get("raw_notional") not in (None, "") for row in price_rows)
+
+
+def _execution_capacity_metadata(enabled: bool) -> dict[str, bool | str | None]:
+    """Record whether liquidity capacity was checked without inventing traded value."""
+
+    if enabled:
+        return {
+            "enabled": True,
+            "status": "source_raw_notional_validated",
+            "reason_code": None,
+            "detail": "Participation-capacity checks used source-provided traded value.",
+        }
+    return {
+        "enabled": False,
+        "status": "not_evaluated",
+        "reason_code": "raw_notional_source_missing_or_uncovered",
+        "detail": (
+            "Price execution used raw OHLCV, but participation-capacity checks were "
+            "not evaluated because source traded value is unavailable."
+        ),
+    }
+
+
+def _merge_generated_signals(
+    metric_rows: list[dict[str, object]], generated_signals: list[GeneratedSignal]
+) -> list[dict[str, object]]:
+    metrics_by_key = {(str(row["date"]), str(row["ticker"]).zfill(6)): row for row in metric_rows}
+    tickers_by_date: dict[str, list[str]] = {}
+    for row in metric_rows:
+        tickers_by_date.setdefault(str(row["date"]), []).append(str(row["ticker"]).zfill(6))
+    for signal in generated_signals:
+        if signal.ticker is None:
+            tickers_for_date = tickers_by_date.get(signal.date, [])
+            if not tickers_for_date:
+                raise ValueError(
+                    f"generated signal date {signal.date} is not present in price rows"
+                )
+            if len(tickers_for_date) > 1:
+                raise ValueError(f"generated signal date {signal.date} is ambiguous without ticker")
+            for ticker in tickers_for_date:
+                metrics_by_key[(signal.date, ticker)][GENERATED_SIGNAL_METRIC] = (
+                    SIGNAL_METRIC_VALUES[signal.action]
+                )
+            continue
+        key = (signal.date, signal.ticker)
+        if key not in metrics_by_key:
+            raise ValueError(
+                f"generated signal {signal.date}/{signal.ticker} is not present in price rows"
+            )
+        metrics_by_key[key][GENERATED_SIGNAL_METRIC] = SIGNAL_METRIC_VALUES[signal.action]
+    for row in metric_rows:
+        row.setdefault(GENERATED_SIGNAL_METRIC, HOLD_SIGNAL_VALUE)
+    return metric_rows
+
+
+def _engine_strategy_spec(
+    strategy: AIStrategySpec,
+    candidate: CodeCandidate,
+    *,
+    available_ticker_count: int | None = None,
+    execution_capacity_enabled: bool = True,
+):
+    return EngineStrategySpec(
+        strategy_id=f"{strategy.strategy_id}_{candidate.candidate_id.lower()}",
+        strategy_name=f"{strategy.name} {candidate.candidate_id}",
+        description="Generated candidate signals executed by backtest_module.",
+        entry_rules=[
+            EngineCondition(
+                left=GENERATED_SIGNAL_METRIC,
+                operator=EngineConditionOperator.EQ,
+                right=BUY_SIGNAL_VALUE,
+                description="generated BUY signal",
+            )
+        ],
+        exit_rules=[
+            EngineCondition(
+                left=GENERATED_SIGNAL_METRIC,
+                operator=EngineConditionOperator.EQ,
+                right=SELL_SIGNAL_VALUE,
+                description="generated SELL signal",
+            )
+        ],
+        position_sizing=_engine_position_sizing(
+            strategy,
+            available_ticker_count=available_ticker_count,
+        ),
+        risk_controls=_engine_risk_controls(strategy, candidate=candidate),
+        backtest={
+            "cost_model": {
+                "commission_pct": float(
+                    strategy.risk_constraints.get("commission_pct", DEFAULT_COMMISSION_PCT)
+                ),
+                "tax_pct": float(strategy.risk_constraints.get("tax_pct", DEFAULT_TAX_PCT)),
+                "slippage_pct": float(
+                    strategy.risk_constraints.get("slippage_pct", DEFAULT_SLIPPAGE_PCT)
+                ),
+            },
+            # Capacity is a separate claim from price execution. The engine can run
+            # next-open fills using verified raw OHLCV even when source-provided KRX
+            # traded value is unavailable. Never invent it from close × volume.
+            "execution_capacity": {"enabled": execution_capacity_enabled},
+        },
+    )
+
+
+def _engine_position_sizing(
+    strategy: AIStrategySpec,
+    *,
+    available_ticker_count: int | None = None,
+):
+    applied_max_positions = _applied_max_positions(strategy, available_ticker_count)
+    return EnginePositionSizing(max_positions=applied_max_positions)
+
+
+def _engine_risk_controls(strategy: AIStrategySpec, *, candidate: CodeCandidate | None = None):
+    """Risk controls for the engine, which is the only place a stop is applied.
+
+    The candidate's own stop/target win when it has them: they are part of the search
+    surface, and the action generator used to apply them itself. It no longer does -
+    it only knows the signal-day close, while the engine knows the price actually paid
+    at the next open - so the search values have to reach the engine or the search over
+    them silently stops meaning anything.
+    """
+
+    raw = strategy.risk_constraints
+    controls = EngineRiskControls()
+    parameters = candidate.parameters if candidate is not None else None
+    stop_loss_pct = _optional_positive_float(
+        raw.get("stop_loss_pct"), "stop_loss_pct", upper_bound=1.0
+    )
+    take_profit_pct = _optional_positive_float(raw.get("take_profit_pct"), "take_profit_pct")
+    if parameters is not None:
+        stop_loss_pct = parameters.stop_loss_pct
+        take_profit_pct = parameters.take_profit_pct
+    max_position_pct = _optional_positive_float(
+        raw.get("max_position_pct"), "max_position_pct", upper_bound=1.0
+    )
+    if stop_loss_pct is not None:
+        controls = controls.model_copy(update={"stop_loss_pct": stop_loss_pct})
+    if take_profit_pct is not None:
+        controls = controls.model_copy(update={"take_profit_pct": take_profit_pct})
+    if max_position_pct is not None:
+        controls = controls.model_copy(update={"max_single_position_pct": max_position_pct})
+    return controls
+
+
+def _requested_max_positions(strategy: AIStrategySpec) -> int:
+    return max(1, math.ceil(1.0 / _strategy_max_position_pct(strategy)))
+
+
+def _applied_max_positions(
+    strategy: AIStrategySpec, available_ticker_count: int | None = None
+) -> int:
+    requested = _requested_max_positions(strategy)
+    if available_ticker_count is None or available_ticker_count <= 0:
+        return requested
+    return min(requested, available_ticker_count)
+
+
+def _strategy_max_position_pct(strategy: AIStrategySpec) -> float:
+    return required_max_position_pct(strategy.risk_constraints)
+
+
+def _available_ticker_count(price_rows: Sequence[Mapping[str, Any]]) -> int:
+    return _shared_available_ticker_count(price_rows)
+
+
+def _ticker_actions(
+    engine_result: Any, rows: Sequence[Mapping[str, Any]], candidate_id: str
+) -> list[dict[str, Any]]:
+    """Today's verdict per stock, taken from the run that was just validated.
+
+    A backtest that ends yesterday already contains today's instruction: the last bar's
+    signals are what the rule says now, and the engine's surviving positions are what the
+    book holds now. Deriving the recommendation from anywhere else - re-evaluating the
+    conditions in a separate code path, say - would produce a second answer that can
+    disagree with the one the performance numbers came from.
+
+    HOLD and SELL therefore need the position book, not the signal stream: the engine
+    skips buys it has no cash or slot for, so a BUY signal does not mean a position
+    exists. Only names the rule actually acts on are returned; a name the strategy is
+    neither in nor entering has no recommendation to give, and the caller fills those in
+    as WATCH against whatever list it is presenting.
+    """
+
+    dates = {str(row.get("date") or "") for row in rows}
+    if not dates:
+        return []
+    as_of = max(dates)
+    summary = getattr(engine_result, "summary", {}) or {}
+    held_raw = summary.get("open_position_tickers")
+    held = (
+        {str(t) for t in held_raw}
+        if isinstance(held_raw, Sequence) and not isinstance(held_raw, (str, bytes))
+        else set()
+    )
+
+    last_signal: dict[str, str] = {}
+    for signal in getattr(engine_result, "signals", []):
+        if str(getattr(signal, "date", "")) != as_of:
+            continue
+        action = str(getattr(signal, "action", "")).upper()
+        ticker = str(getattr(signal, "ticker", ""))
+        if not ticker:
+            continue
+        if action.endswith("BUY"):
+            last_signal[ticker] = "BUY"
+        elif action.endswith("SELL"):
+            last_signal[ticker] = "SELL"
+
+    closes = {
+        str(row.get("ticker")): row.get("close")
+        for row in rows
+        if str(row.get("date") or "") == as_of
+    }
+    names: dict[str, str] = {}
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        if name:
+            names[str(row.get("ticker"))] = name
+
+    actions: list[dict[str, Any]] = []
+    for ticker in sorted(held | set(last_signal)):
+        signal = last_signal.get(ticker)
+        if ticker in held:
+            action = "SELL" if signal == "SELL" else "HOLD"
+            reason = (
+                "청산 조건 충족 - 보유 종목 매도"
+                if signal == "SELL"
+                else "청산 조건 미충족 - 보유 유지"
+            )
+        elif signal == "BUY":
+            action, reason = "BUY", "진입 조건 충족 - 신규 매수"
+        else:
+            # A SELL on a name the book is not in is not an instruction to anyone.
+            continue
+        actions.append(
+            {
+                "ticker": ticker,
+                "name": names.get(ticker) or ticker,
+                "action": action,
+                "reason": reason,
+                "as_of_date": as_of,
+                "close": closes.get(ticker),
+                "source_candidate_id": candidate_id,
+            }
+        )
+    return actions
+
+
+def _execution_audit(engine_result: Any) -> dict[str, Any]:
+    events = [event.as_dict() for event in getattr(engine_result, "order_audit", [])]
+    executed_buy_count = sum(
+        1
+        for event in events
+        if str(event.get("status")) == "executed" and str(event.get("side")) == "buy"
+    )
+    executed_sell_count = sum(
+        1
+        for event in events
+        if str(event.get("status")) == "executed" and str(event.get("side")) == "sell"
+    )
+    blocked_count = sum(
+        1
+        for event in events
+        if str(event.get("status")).startswith("skipped")
+        or str(event.get("status")) == "ignored_missing_position"
+    )
+    unfilled_end_count = sum(1 for event in events if str(event.get("status")) == "unfilled_end")
+    return {
+        "submitted_count": sum(1 for event in events if str(event.get("status")) == "submitted"),
+        "executed_buy_count": executed_buy_count,
+        "executed_sell_count": executed_sell_count,
+        "blocked_count": blocked_count,
+        "unfilled_end_count": unfilled_end_count,
+        "completed_trade_count": len(getattr(engine_result, "trades", [])),
+        "has_real_fills": executed_buy_count > 0 or executed_sell_count > 0,
+        "recent_events": events[-EXECUTION_AUDIT_TAIL_LIMIT:],
+    }
+
+
+def _expected_max_sharpe(candidate_count: int, observations: int) -> float:
+    """The in-sample Sharpe a skill-free search over `candidate_count` tries would give.
+
+    Picking the best of N candidates is an argmax over N noisy estimates, so the winner's
+    in-sample Sharpe is biased upward even when nothing has any edge. This is the
+    standard expected-maximum-of-N-normals approximation used for the deflated Sharpe
+    ratio, scaled by the standard error of a Sharpe estimate over `observations` bars.
+
+    Measured with candidates whose trades are random on real prices: mean return -3.7%,
+    best-of-six +16.2%. Nearly twenty points of headline out of nothing.
+    """
+
+    if candidate_count <= 1 or observations <= 1:
+        return 0.0
+    # E[max of n standard normals], Gumbel approximation - accurate to ~1% for n >= 4
+    # and conservative (too small, so it under-corrects) for the n = 2..3 the first
+    # round uses.
+    euler = 0.5772156649015329
+    n = float(candidate_count)
+    expected_max_z = (1.0 - euler) * _normal_quantile(1.0 - 1.0 / n) + euler * _normal_quantile(
+        1.0 - 1.0 / (n * math.e)
+    )
+    # Standard error of an annualised Sharpe estimate over `observations` daily bars.
+    return expected_max_z * math.sqrt(252.0 / observations)
+
+
+def _normal_quantile(p: float) -> float:
+    """Inverse standard normal CDF (Acklam's rational approximation)."""
+
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    a = (
+        -39.69683028665376,
+        220.9460984245205,
+        -275.9285104469687,
+        138.3577518672690,
+        -30.66479806614716,
+        2.506628277459239,
+    )
+    b = (
+        -54.47609879822406,
+        161.5858368580409,
+        -155.6989798598866,
+        66.80131188771972,
+        -13.28068155288572,
+    )
+    c = (
+        -0.007784894002430293,
+        -0.3223964580411365,
+        -2.400758277161838,
+        -2.549732539343734,
+        4.374664141464968,
+        2.938163982698783,
+    )
+    d = (0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416)
+    plow, phigh = 0.02425, 1.0 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+        )
+    if p > phigh:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+        )
+    q = p - 0.5
+    r = q * q
+    return (
+        (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5])
+        * q
+        / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    )
+
+
+def _metrics_from_engine_result(
+    engine_result,
+    *,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    benchmark_returns: Sequence[float] | None = None,
+    candidate_count: int = 1,
+) -> BacktestMetrics:
+    summary = engine_result.summary
+    metric_warnings = _summary_warning_list(summary)
+    selection_mode = summary.get("metrics_mode") == "selection"
+    daily_returns = (
+        _native_returns_from_equity_curve(engine_result.equity_curve)
+        if selection_mode
+        else returns_from_equity_curve(engine_result.equity_curve)
+    )
+    sharpe = _summary_float_default(
+        summary, "sharpe", _summary_float_default(summary, "daily_sharpe_like", 0.0)
+    )
+    in_sample_sharpe, out_sample_sharpe = _split_sharpes(
+        daily_returns,
+        metric_warnings,
+        native=selection_mode,
+    )
+    degradation = _degradation(in_sample_sharpe, out_sample_sharpe)
+    split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
+    in_sample_returns = daily_returns[:split_index]
+    out_sample_returns = daily_returns[split_index:]
+    selection_adjusted_sharpe = in_sample_sharpe - _expected_max_sharpe(
+        candidate_count, len(in_sample_returns)
+    )
+    resolved_benchmark_returns = (
+        benchmark_returns
+        if benchmark_returns is not None
+        else _benchmark_daily_returns(price_rows or ())
+    )
+    comparison_length = min(len(daily_returns), len(resolved_benchmark_returns))
+    strategy_comparison_returns = daily_returns[:comparison_length]
+    benchmark_comparison_returns = resolved_benchmark_returns[:comparison_length]
+    comparison_split_index = min(split_index, comparison_length)
+    in_sample_benchmark_returns = benchmark_comparison_returns[:comparison_split_index]
+    out_sample_benchmark_returns = benchmark_comparison_returns[comparison_split_index:]
+    in_sample_benchmark_return = _compound_returns(in_sample_benchmark_returns)
+    out_sample_benchmark_return = _compound_returns(out_sample_benchmark_returns)
+    in_sample_return = _compound_returns(in_sample_returns)
+    out_sample_return = _compound_returns(out_sample_returns)
+    period_stats = _benchmark_period_stats(
+        strategy_comparison_returns,
+        benchmark_comparison_returns,
+    )
+    in_sample_period_stats = _benchmark_period_stats(
+        strategy_comparison_returns[:comparison_split_index],
+        in_sample_benchmark_returns,
+    )
+    out_sample_period_stats = _benchmark_period_stats(
+        strategy_comparison_returns[comparison_split_index:],
+        out_sample_benchmark_returns,
+    )
+    return BacktestMetrics(
+        sharpe_ratio=round(sharpe, METRIC_ROUND_DIGITS),
+        max_drawdown=round(_summary_float(summary, "max_drawdown"), METRIC_ROUND_DIGITS),
+        win_rate=round(_summary_float(summary, "win_rate"), METRIC_ROUND_DIGITS),
+        total_return=round(
+            _summary_float_default(
+                summary, "total_return", _summary_float_default(summary, "period_return", 0.0)
+            ),
+            METRIC_ROUND_DIGITS,
+        ),
+        in_sample_sharpe=round(in_sample_sharpe, METRIC_ROUND_DIGITS),
+        out_sample_sharpe=round(out_sample_sharpe, METRIC_ROUND_DIGITS),
+        degradation=round(degradation, METRIC_ROUND_DIGITS),
+        in_sample_return=round(in_sample_return, METRIC_ROUND_DIGITS),
+        in_sample_max_drawdown=round(
+            _max_drawdown_from_returns(in_sample_returns), METRIC_ROUND_DIGITS
+        ),
+        out_sample_return=round(out_sample_return, METRIC_ROUND_DIGITS),
+        out_sample_max_drawdown=round(
+            _max_drawdown_from_returns(out_sample_returns), METRIC_ROUND_DIGITS
+        ),
+        in_sample_observations=len(in_sample_returns),
+        candidates_evaluated=max(1, candidate_count),
+        selection_adjusted_sharpe=round(selection_adjusted_sharpe, METRIC_ROUND_DIGITS),
+        in_sample_benchmark_return=round(in_sample_benchmark_return, METRIC_ROUND_DIGITS),
+        out_sample_benchmark_return=round(out_sample_benchmark_return, METRIC_ROUND_DIGITS),
+        in_sample_excess_return=round(
+            in_sample_return - in_sample_benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
+        out_sample_excess_return=round(
+            out_sample_return - out_sample_benchmark_return,
+            METRIC_ROUND_DIGITS,
+        ),
+        benchmark_period_count=period_stats.count,
+        benchmark_period_win_rate=round(period_stats.win_rate, METRIC_ROUND_DIGITS),
+        benchmark_period_loss_rate=round(period_stats.loss_rate, METRIC_ROUND_DIGITS),
+        in_sample_benchmark_period_count=in_sample_period_stats.count,
+        in_sample_benchmark_period_win_rate=round(
+            in_sample_period_stats.win_rate, METRIC_ROUND_DIGITS
+        ),
+        in_sample_benchmark_period_loss_rate=round(
+            in_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
+        ),
+        out_sample_benchmark_period_count=out_sample_period_stats.count,
+        out_sample_benchmark_period_win_rate=round(
+            out_sample_period_stats.win_rate, METRIC_ROUND_DIGITS
+        ),
+        out_sample_benchmark_period_loss_rate=round(
+            out_sample_period_stats.loss_rate, METRIC_ROUND_DIGITS
+        ),
+    )
+
+
+def _public_equity_curve(engine_result) -> list[BacktestEquityPoint]:
+    summary = engine_result.summary
+    initial_capital = _summary_float(summary, "initial_capital")
+    if initial_capital == 0:
+        return []
+
+    sampled_points = _sample_points(engine_result.equity_curve, PUBLIC_EQUITY_CURVE_POINTS)
+    return [
+        BacktestEquityPoint(
+            date=str(point.date),
+            cumulative_return=round(
+                (float(point.total_equity) / initial_capital) - 1,
+                METRIC_ROUND_DIGITS,
+            ),
+        )
+        for point in sampled_points
+    ]
+
+
+def _sample_points(points: Sequence[Any], max_points: int) -> list[Any]:
+    if len(points) <= max_points:
+        return list(points)
+
+    last_index = len(points) - 1
+    step = last_index / (max_points - 1)
+    indices = sorted({round(index * step) for index in range(max_points)})
+    if indices[0] != 0:
+        indices.insert(0, 0)
+    if indices[-1] != last_index:
+        indices.append(last_index)
+    return [points[index] for index in indices]
+
+
+def _split_sharpes(
+    daily_returns: list[float],
+    metric_warnings: list[dict[str, str]],
+    *,
+    native: bool = False,
+) -> tuple[float, float]:
+    sharpe_function = _native_sharpe_like if native else _sharpe_like
+    if len(daily_returns) < MIN_RETURNS_FOR_SPLIT:
+        full_sample = sharpe_function(
+            daily_returns, metric_name="full_sample_sharpe", metric_warnings=metric_warnings
+        )
+        return full_sample, full_sample
+    split_index = max(1, int(len(daily_returns) * BACKTEST_SPLIT_FRACTION))
+    return (
+        sharpe_function(
+            daily_returns[:split_index],
+            metric_name="in_sample_sharpe",
+            metric_warnings=metric_warnings,
+        ),
+        sharpe_function(
+            daily_returns[split_index:],
+            metric_name="out_sample_sharpe",
+            metric_warnings=metric_warnings,
+        ),
+    )
+
+
+def _compound_returns(daily_returns: Sequence[float]) -> float:
+    return math.prod((1.0 + daily_return for daily_return in daily_returns), start=1.0) - 1.0
+
+
+def walk_forward_policy_for(
+    price_rows: Sequence[Mapping[str, Any]] | int,
+) -> WalkForwardPolicy:
+    """Pick the fold geometry the loaded window can actually fill.
+
+    Accepts price rows or a month count. At or above 41 months the five-year contract
+    is returned unchanged, so nothing about the long-window behaviour moves.
+    """
+
+    months = (
+        price_rows
+        if isinstance(price_rows, int)
+        else len({str(row["date"])[:7] for row in price_rows if row.get("date") is not None})
+    )
+    if months <= WALK_FORWARD_SHORT_WINDOW_MAX_MONTHS:
+        return WalkForwardPolicy(
+            tier="short_window",
+            warmup_months=1,
+            train_months=6,
+            validation_months=1,
+            evaluation_months=1,
+            roll_months=1,
+            min_valid_folds=3,
+            min_unique_evaluation_months=3,
+            min_unique_evaluation_sessions=60,
+        )
+    if months < WALK_FORWARD_FULL_WINDOW_MIN_MONTHS:
+        # One fold consumes 17 months, so `months - 17` is every fold the window can
+        # build; six is the floor below which a rolling estimate says nothing.
+        folds = max(6, months - 17)
+        return WalkForwardPolicy(
+            tier="medium_window",
+            warmup_months=1,
+            train_months=12,
+            validation_months=3,
+            evaluation_months=1,
+            roll_months=1,
+            min_valid_folds=folds,
+            min_unique_evaluation_months=folds,
+            min_unique_evaluation_sessions=20 * folds,
+        )
+    return FIVE_YEAR_WALK_FORWARD_POLICY
+
+
+def _walk_forward_split_policy(price_rows: Sequence[Mapping[str, Any]]) -> _SplitPolicy:
+    sessions_by_month: dict[str, list[str]] = defaultdict(list)
+    for session in sorted(
+        {str(row.get("date")) for row in price_rows if row.get("date") is not None}
+    ):
+        sessions_by_month[session[:7]].append(session)
+    months = tuple(sorted(sessions_by_month))
+    window = walk_forward_policy_for(len(months))
+    warmup_sessions = tuple(
+        session for month in months[: window.warmup_months] for session in sessions_by_month[month]
+    )
+    folds: list[_WalkForwardFold] = []
+    span = window.train_months + window.validation_months + window.evaluation_months
+    for start in range(0, len(months) - (span + window.warmup_months) + 1, window.roll_months):
+        warmup_months = months[start : start + window.warmup_months]
+        train_start = start + window.warmup_months
+        train_months = months[train_start : train_start + window.train_months]
+        validation_start = train_start + window.train_months
+        validation_months = months[validation_start : validation_start + window.validation_months]
+        evaluation_months = months[
+            validation_start + window.validation_months : validation_start
+            + window.validation_months
+            + window.evaluation_months
+        ]
+        fold = _WalkForwardFold(
+            fold_index=len(folds),
+            warmup_sessions=tuple(
+                session for month in warmup_months for session in sessions_by_month[month]
+            ),
+            train_sessions=tuple(
+                session for month in train_months for session in sessions_by_month[month]
+            ),
+            validation_sessions=tuple(
+                session for month in validation_months for session in sessions_by_month[month]
+            ),
+            evaluation_sessions=tuple(
+                session for month in evaluation_months for session in sessions_by_month[month]
+            ),
+        )
+        if (
+            fold.warmup_sessions
+            and fold.train_sessions
+            and fold.validation_sessions
+            and fold.evaluation_sessions
+        ):
+            folds.append(fold)
+    final_lockbox_sessions = folds[-1].evaluation_sessions if folds else ()
+    return _SplitPolicy(
+        warmup_sessions=warmup_sessions,
+        folds=tuple(folds),
+        final_lockbox_sessions=final_lockbox_sessions,
+        walk_forward=window,
+    )
+
+
+def _walk_forward_sample(price_rows: Sequence[Mapping[str, Any]]) -> _WalkForwardSample:
+    sessions = {str(row.get("date")) for row in price_rows if row.get("date") is not None}
+    policy = _walk_forward_split_policy(price_rows)
+    window = policy.walk_forward
+    evaluation_sessions = [session for fold in policy.folds for session in fold.evaluation_sessions]
+    unique_evaluation_sessions = set(evaluation_sessions)
+    evaluation_months = {session[:7] for session in unique_evaluation_sessions}
+    meets_minimum = (
+        len(policy.folds) >= window.min_valid_folds
+        and len(evaluation_months) >= window.min_unique_evaluation_months
+        and len(unique_evaluation_sessions) >= window.min_unique_evaluation_sessions
+    )
+    return _WalkForwardSample(
+        session_count=len(sessions),
+        valid_fold_count=len(policy.folds),
+        unique_evaluation_month_count=len(evaluation_months),
+        unique_evaluation_session_count=len(unique_evaluation_sessions),
+        status=READY_WALK_FORWARD if meets_minimum else INSUFFICIENT_WALK_FORWARD_SAMPLE,
+        policy=window,
+    )
+
+
+def _walk_forward_metadata(
+    sample: _WalkForwardSample, policy: _SplitPolicy | None = None
+) -> dict[str, Any]:
+    window = sample.policy
+    return {
+        "policy": window.label,
+        # The geometry is window-proportional, so a report cannot read the minimums off
+        # a fixed contract any more - they travel with the result.
+        "walk_forward_policy": window.as_dict(),
+        "session_count": sample.session_count,
+        "valid_fold_count": sample.valid_fold_count,
+        "unique_evaluation_month_count": sample.unique_evaluation_month_count,
+        "unique_evaluation_session_count": sample.unique_evaluation_session_count,
+        "minimums": {
+            "unique_evaluation_sessions": window.min_unique_evaluation_sessions,
+            "valid_folds": window.min_valid_folds,
+            "unique_evaluation_months": window.min_unique_evaluation_months,
+        },
+        "status": sample.status,
+        # QV-OOS-01 asks for the seed behind candidate selection. There is none to
+        # report: no path in `ai_graph` or `backtest_module` draws from an RNG, so a
+        # run is reproducible from its inputs alone and `slot_priority` - score first,
+        # ticker only as a tie-break - fixes the order whenever scores collide.
+        # Emitting a number here would name a knob that does not exist, which is worse
+        # than saying so; a reader checking reproducibility needs the basis, not a digit.
+        "selection_seed": None,
+        "selection_determinism": "deterministic_no_rng",
+        "selection_tie_break": "slot_priority:(-score, ticker)",
+        # Eligibility says the session boundary is large enough to calculate OOS
+        # statistics. It is deliberately separate from availability: a real result
+        # has not been calculated until the rolling evaluation engine supplies it.
+        "aggregate_oos_eligible": sample.status == READY_WALK_FORWARD,
+        "aggregate_oos_available": False,
+        "aggregate_oos_result": {
+            "availability": "unavailable",
+            "reason": (
+                "aggregate_oos_not_computed"
+                if sample.status == READY_WALK_FORWARD
+                else sample.status
+            ),
+        },
+        "candidates_evaluated": None,
+        "benchmark_comparison_available": False,
+        "selection_scope": "train_validation_only",
+        "final_lockbox_excluded_from_selection": True,
+        "unavailable_reason": None if sample.status == READY_WALK_FORWARD else sample.status,
+        "fold_evaluation_months": [
+            fold.evaluation_month for fold in (policy.folds if policy else ())
+        ],
+        "final_lockbox_sessions": list(policy.final_lockbox_sessions) if policy else [],
+    }
+
+
+def _walk_forward_oos_result(
+    walk_forward: WalkForwardPolicyResult | None,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Expose the result of rolling evaluation, or one stable reason it is absent."""
+
+    if walk_forward is not None and walk_forward.aggregate_metrics is not None:
+        metrics = walk_forward.aggregate_metrics
+        return {
+            "availability": "available",
+            "total_return": metrics.out_sample_return,
+            "sharpe_ratio": metrics.out_sample_sharpe,
+            "max_drawdown": metrics.max_drawdown,
+            "evaluation_session_count": walk_forward.unique_evaluation_session_count,
+        }
+
+    reason = (
+        walk_forward.unavailable_reason
+        if walk_forward is not None
+        else metadata.get("unavailable_reason")
+    )
+    return {
+        "availability": "unavailable",
+        "reason": str(reason or "aggregate_oos_not_computed"),
+    }
+
+
+def _attach_walk_forward_artifact(
+    result: CandidateBacktestResult,
+    candidate_count: int,
+) -> CandidateBacktestResult:
+    """Bind search width and the actual OOS result to the same output artifact."""
+
+    engine_summary = dict(result.engine_summary)
+    existing = engine_summary.get("walk_forward_sample")
+    if not isinstance(existing, Mapping):
+        return result
+
+    artifact = _walk_forward_artifact(existing, candidate_count, result.walk_forward)
+    backtest_payload = dict(result.backtest_payload)
+    backtest_payload["walk_forward_sample"] = artifact
+    return result.model_copy(
+        update={
+            "engine_summary": {**engine_summary, "walk_forward_sample": artifact},
+            "backtest_payload": backtest_payload,
+        }
+    )
+
+
+def _walk_forward_artifact(
+    metadata: Mapping[str, Any],
+    candidate_count: int,
+    walk_forward: WalkForwardPolicyResult | None,
+) -> dict[str, Any]:
+    """Return one OOS artifact containing boundaries, search width, and result."""
+
+    oos_result = _walk_forward_oos_result(walk_forward, metadata)
+    return {
+        **metadata,
+        "candidates_evaluated": max(1, candidate_count),
+        "aggregate_oos_available": oos_result["availability"] == "available",
+        "aggregate_oos_result": oos_result,
+    }
+
+
+def _benchmark_daily_returns(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> list[float]:
+    curve, _ = _equal_weight_benchmark_curve(price_rows)
+    return _daily_returns_from_benchmark_curve(curve)
+
+
+def _daily_returns_from_benchmark_curve(
+    curve: Sequence[BacktestEquityPoint],
+) -> list[float]:
+    if len(curve) < 2:
+        return []
+    returns: list[float] = []
+    previous_equity = 1.0 + float(curve[0].cumulative_return)
+    for point in curve[1:]:
+        current_equity = 1.0 + float(point.cumulative_return)
+        if previous_equity <= 0.0:
+            return []
+        returns.append(current_equity / previous_equity - 1.0)
+        previous_equity = current_equity
+    return returns
+
+
+def _build_benchmark_context(
+    price_rows: Sequence[Mapping[str, Any]],
+    official_benchmark: Mapping[str, Any] | None = None,
+) -> _BenchmarkContext:
+    """Keep auxiliary proxy legs separate from the optional official primary series."""
+
+    auxiliary_curve, _ = _equal_weight_benchmark_curve(price_rows)
+    selection_days = max(
+        1,
+        int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+    )
+    selection_index = min(max(0, selection_days - 1), len(auxiliary_curve) - 1)
+    selection_return = (
+        float(auxiliary_curve[selection_index].cumulative_return) if auxiliary_curve else 0.0
+    )
+    total_return, coverage, unavailable_reason = _official_benchmark_total_return(
+        price_rows, official_benchmark
+    )
+    return _BenchmarkContext(
+        daily_returns=tuple(_daily_returns_from_benchmark_curve(auxiliary_curve)),
+        selection_days=selection_days,
+        selection_return=selection_return,
+        total_return=total_return,
+        primary_available=total_return is not None,
+        primary_unavailable_reason=unavailable_reason,
+        auxiliary_label=AUXILIARY_BENCHMARK_LABEL,
+        primary_coverage=coverage,
+        # The curve's first point is the base (cumulative_return 0.0) and carries no
+        # daily return, so the sessions line up with ``daily_returns`` from index 1.
+        daily_return_sessions=tuple(str(point.date) for point in auxiliary_curve[1:]),
+        auxiliary_return=(
+            float(auxiliary_curve[-1].cumulative_return) if auxiliary_curve else None
+        ),
+    )
+
+
+def benchmark_daily_returns_for_sessions(
+    context: _BenchmarkContext | None,
+    sessions: Iterable[str],
+) -> list[float]:
+    """The auxiliary proxy's daily returns restricted to ``sessions``, in date order.
+
+    Interface for the walk-forward aggregate, which measures a strategy over the
+    evaluation sessions of every fold rather than the whole window: pass those
+    sessions and compare like with like. Returns an empty list when the proxy does
+    not cover them.
+    """
+
+    if context is None or not context.daily_return_sessions:
+        return []
+    wanted = {str(session) for session in sessions}
+    return [
+        value
+        for session, value in zip(
+            context.daily_return_sessions, context.daily_returns, strict=False
+        )
+        if session in wanted
+    ]
+
+
+def benchmark_return_for_sessions(
+    context: _BenchmarkContext | None,
+    sessions: Iterable[str],
+) -> float | None:
+    """The auxiliary proxy's compounded return over exactly ``sessions``."""
+
+    returns = benchmark_daily_returns_for_sessions(context, sessions)
+    return _compound_returns(returns) if returns else None
+
+
+def _official_benchmark_total_return(
+    price_rows: Sequence[Mapping[str, Any]],
+    official_benchmark: Mapping[str, Any] | None,
+) -> tuple[float | None, dict[str, Any] | None, str | None]:
+    if not isinstance(official_benchmark, Mapping) or not official_benchmark:
+        return None, None, PRIMARY_BENCHMARK_MISSING_INPUT_REASON
+    if not official_benchmark.get("available"):
+        # This value reaches public metric details.  The source adapter may have
+        # caught a driver exception, so its explanatory text must never cross this
+        # boundary even if an older adapter or persisted job supplied it.
+        return None, None, PRIMARY_BENCHMARK_SOURCE_UNAVAILABLE_REASON
+
+    sessions = sorted({str(row.get("date")) for row in price_rows if row.get("date")})
+    if not sessions:
+        return None, None, "the backtest window has no sessions to measure a benchmark over"
+    kospi = _official_benchmark_levels(official_benchmark.get("kospi_tr"), sessions)
+    kosdaq = _official_benchmark_levels(official_benchmark.get("kosdaq_tr"), sessions)
+    covered = sorted(set(kospi) & set(kosdaq))
+    coverage: dict[str, Any] = {
+        "backtest_sessions": len(sessions),
+        "covered_sessions": len(covered),
+        "coverage_ratio": round(len(covered) / len(sessions), METRIC_ROUND_DIGITS),
+        "minimum_coverage_ratio": OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE,
+        "first_session": sessions[0],
+        "last_session": sessions[-1],
+        "first_session_covered": bool(covered) and covered[0] == sessions[0],
+        "last_session_covered": bool(covered) and covered[-1] == sessions[-1],
+    }
+    if not covered:
+        return (
+            None,
+            coverage,
+            (
+                "official KOSPI and KOSDAQ TR levels share no session with the backtest window "
+                f"({sessions[0]}..{sessions[-1]})"
+            ),
+        )
+    if not coverage["first_session_covered"] or not coverage["last_session_covered"]:
+        return (
+            None,
+            coverage,
+            (
+                "official TR levels do not cover both endpoints of the backtest window "
+                f"({sessions[0]}..{sessions[-1]}); covered {covered[0]}..{covered[-1]}"
+            ),
+        )
+    if coverage["coverage_ratio"] < OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:
+        return (
+            None,
+            coverage,
+            (
+                f"official TR levels cover {len(covered)}/{len(sessions)} backtest sessions, "
+                f"below the required {OFFICIAL_BENCHMARK_MIN_SESSION_COVERAGE:.0%}"
+            ),
+        )
+    weights = _lagged_official_benchmark_weights(official_benchmark.get("monthly_weights"), covered)
+    try:
+        _, total_return = _official_krx_tr_benchmark_curve(kospi, kosdaq, weights)
+    except ValueError as error:
+        return None, coverage, f"official benchmark curve could not be computed: {error}"
+    if total_return is None:
+        return None, coverage, "official benchmark curve produced no observations"
+    return float(total_return), coverage, None
+
+
+def _official_benchmark_levels(series: Any, sessions: Sequence[str]) -> dict[str, float]:
+    if not isinstance(series, Mapping):
+        return {}
+    wanted = set(sessions)
+    levels: dict[str, float] = {}
+    for raw_date, raw_value in series.items():
+        session = str(raw_date)
+        if session not in wanted:
+            continue
+        try:
+            level = _finite_float(raw_value, "official benchmark TR level")
+        except (TypeError, ValueError):
+            continue
+        if level > 0.0:
+            levels[session] = level
+    return levels
+
+
+def _lagged_official_benchmark_weights(
+    monthly_weights: Any, sessions: Sequence[str]
+) -> dict[str, tuple[float, float]]:
+    published: dict[str, tuple[float, float]] = {}
+    if isinstance(monthly_weights, Mapping):
+        for raw_month, raw_weights in monthly_weights.items():
+            pair = _official_benchmark_weight_pair(raw_weights)
+            if pair is not None:
+                published[str(raw_month)[:7]] = pair
+    lagged: dict[str, tuple[float, float]] = {}
+    for session in sessions:
+        month = str(session)[:7]
+        if month in lagged:
+            continue
+        previous = _previous_month(month)
+        if previous in published:
+            lagged[month] = published[previous]
+    return lagged
+
+
+def _official_benchmark_weight_pair(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, Mapping):
+        candidate = (value.get("kospi_weight"), value.get("kosdaq_weight"))
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        if len(value) != 2:
+            return None
+        candidate = (value[0], value[1])
+    else:
+        return None
+    try:
+        return (
+            _finite_float(candidate[0], "kospi_weight"),
+            _finite_float(candidate[1], "kosdaq_weight"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _previous_month(month: str) -> str:
+    try:
+        year, month_number = (int(part) for part in month.split("-", 1))
+    except ValueError:
+        return month
+    if month_number == 1:
+        return f"{year - 1:04d}-12"
+    return f"{year:04d}-{month_number - 1:02d}"
+
+
+def _benchmark_provenance(context: _BenchmarkContext) -> dict[str, Any]:
+    return {
+        "primary": {
+            "label": PRIMARY_BENCHMARK_LABEL,
+            "method": PRIMARY_BENCHMARK_METHOD,
+            "available": context.primary_available,
+            "official_series_and_lagged_weights": context.primary_available,
+            "return": context.total_return if context.primary_available else None,
+            "unavailable_reason": context.primary_unavailable_reason,
+            "session_coverage": (
+                dict(context.primary_coverage) if context.primary_coverage is not None else None
+            ),
+        },
+        "auxiliary": {
+            "label": context.auxiliary_label,
+            "method": AUXILIARY_BENCHMARK_METHOD,
+            "warning": AUXILIARY_BENCHMARK_WARNING,
+            "return": context.auxiliary_return,
+            # Which series the acceptance floor actually judged against. The official
+            # TR view is absent from this warehouse, and refusing to judge at all made
+            # every automatic run fail on a data gap rather than on its performance.
+            "used_for_acceptance": not context.primary_available
+            and context.auxiliary_return is not None,
+        },
+    }
+
+
+def _official_krx_tr_benchmark_curve(
+    kospi_tr: Mapping[str, float],
+    kosdaq_tr: Mapping[str, float],
+    lagged_target_weights: Mapping[str, tuple[float, float]],
+) -> tuple[list[BacktestEquityPoint], float | None]:
+    """Monthly-rebalanced KOSPI/KOSDAQ TR benchmark with fixed intra-month units.
+
+    Each month's units are set from that month's first available TR observations and the
+    target weights lagged from the prior month. Units then remain fixed until the next
+    month, so daily weights drift with relative performance rather than being silently
+    reset every session.
+    """
+    dates = sorted(set(kospi_tr) & set(kosdaq_tr))
+    if not dates:
+        return [], None
+    units: tuple[float, float] | None = None
+    active_month: str | None = None
+    curve: list[BacktestEquityPoint] = []
+    base_value: float | None = None
+    # Missing monthly weights are a data-contract failure, never a 50/50 fallback.
+    for current_date in dates:
+        month = current_date[:7]
+        if month != active_month:
+            if month not in lagged_target_weights:
+                raise ValueError(f"missing lagged official benchmark weights for {month}")
+            weights = lagged_target_weights[month]
+            kospi_weight, kosdaq_weight = (float(weights[0]), float(weights[1]))
+            if (
+                not math.isfinite(kospi_weight)
+                or not math.isfinite(kosdaq_weight)
+                or kospi_weight < 0.0
+                or kosdaq_weight < 0.0
+                or not math.isclose(kospi_weight + kosdaq_weight, 1.0, abs_tol=1e-9)
+            ):
+                raise ValueError(
+                    "official benchmark target weights must be finite, non-negative, and sum to 1"
+                )
+            kospi_level = _finite_float(kospi_tr[current_date], "kospi_tr")
+            kosdaq_level = _finite_float(kosdaq_tr[current_date], "kosdaq_tr")
+            if kospi_level <= 0.0 or kosdaq_level <= 0.0:
+                raise ValueError("official benchmark TR levels must be positive")
+            portfolio_value = (
+                1.0 if units is None else units[0] * kospi_level + units[1] * kosdaq_level
+            )
+            units = (
+                portfolio_value * kospi_weight / kospi_level,
+                portfolio_value * kosdaq_weight / kosdaq_level,
+            )
+            active_month = month
+        assert units is not None
+        value = units[0] * _finite_float(kospi_tr[current_date], "kospi_tr") + units[
+            1
+        ] * _finite_float(kosdaq_tr[current_date], "kosdaq_tr")
+        if base_value is None:
+            base_value = value
+        curve.append(
+            BacktestEquityPoint(
+                date=current_date,
+                cumulative_return=round(value / base_value - 1.0, METRIC_ROUND_DIGITS),
+            )
+        )
+    return curve, curve[-1].cumulative_return
+
+
+def _benchmark_period_stats(
+    strategy_returns: Sequence[float],
+    benchmark_returns: Sequence[float],
+) -> _BenchmarkPeriodStats:
+    """Compare fixed quarter blocks without cherry-picking favourable dates."""
+
+    length = min(len(strategy_returns), len(benchmark_returns))
+    wins = 0
+    losses = 0
+    count = 0
+    for start in range(0, length, BENCHMARK_EVALUATION_PERIOD_DAYS):
+        end = min(length, start + BENCHMARK_EVALUATION_PERIOD_DAYS)
+        if end - start < BENCHMARK_EVALUATION_PERIOD_DAYS:
+            break
+        strategy_return = _compound_returns(strategy_returns[start:end])
+        benchmark_return = _compound_returns(benchmark_returns[start:end])
+        count += 1
+        if strategy_return > benchmark_return + 1e-12:
+            wins += 1
+        elif strategy_return < benchmark_return - 1e-12:
+            losses += 1
+    if count == 0:
+        return _BenchmarkPeriodStats(count=0, win_rate=0.0, loss_rate=0.0)
+    return _BenchmarkPeriodStats(
+        count=count,
+        win_rate=wins / count,
+        loss_rate=losses / count,
+    )
+
+
+def _max_drawdown_from_returns(daily_returns: Sequence[float]) -> float:
+    equity = 1.0
+    peak = equity
+    max_drawdown = 0.0
+    for daily_return in daily_returns:
+        equity *= 1.0 + daily_return
+        peak = max(peak, equity)
+        if peak > 0.0:
+            max_drawdown = min(max_drawdown, equity / peak - 1.0)
+    return max_drawdown
+
+
+def _sharpe_like(
+    daily_returns: list[float],
+    *,
+    metric_name: str = "sharpe",
+    metric_warnings: list[dict[str, str]] | None = None,
+) -> float:
+    return quantstats_sharpe_from_returns(
+        daily_returns,
+        metric_name=metric_name,
+        metric_warnings=metric_warnings,
+    )
+
+
+def _native_returns_from_equity_curve(equity_curve: Sequence[Any]) -> list[float]:
+    values = [float(point.total_equity) for point in equity_curve]
+    return [
+        current / previous - 1.0 for previous, current in zip(values, values[1:]) if previous != 0.0
+    ]
+
+
+def _native_sharpe_like(
+    daily_returns: list[float],
+    *,
+    metric_name: str = "sharpe",
+    metric_warnings: list[dict[str, str]] | None = None,
+) -> float:
+    if len(daily_returns) < 2:
+        if metric_warnings is not None:
+            metric_warnings.append({"metric": metric_name, "reason": "fewer than two returns"})
+        return 0.0
+    mean_return = sum(daily_returns) / len(daily_returns)
+    variance = sum((value - mean_return) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
+    if variance <= 0.0:
+        if metric_warnings is not None:
+            metric_warnings.append({"metric": metric_name, "reason": "zero return variance"})
+        return 0.0
+    return mean_return / math.sqrt(variance) * math.sqrt(252.0)
+
+
+def _mask_unavailable_walk_forward_metrics(
+    metrics: BacktestMetrics, reason: str
+) -> BacktestMetrics:
+    if reason not in {
+        INSUFFICIENT_WALK_FORWARD_SAMPLE,
+        UNSAFE_WALK_FORWARD_CANDIDATE,
+    }:
+        return metrics
+    return metrics.model_copy(
+        update={
+            "out_sample_sharpe": None,
+            "out_sample_return": None,
+            "in_sample_benchmark_return": None,
+            "out_sample_benchmark_return": None,
+            "in_sample_excess_return": None,
+            "out_sample_excess_return": None,
+            "benchmark_period_count": None,
+            "benchmark_period_win_rate": None,
+            "benchmark_period_loss_rate": None,
+            "in_sample_benchmark_period_count": None,
+            "in_sample_benchmark_period_win_rate": None,
+            "in_sample_benchmark_period_loss_rate": None,
+            "out_sample_benchmark_period_count": None,
+            "out_sample_benchmark_period_win_rate": None,
+            "out_sample_benchmark_period_loss_rate": None,
+        }
+    )
+
+
+def _degradation(in_sample_sharpe: float, out_sample_sharpe: float) -> float:
+    if in_sample_sharpe == 0:
+        return 0.0
+    return max(0.0, (in_sample_sharpe - out_sample_sharpe) / abs(in_sample_sharpe))
+
+
+def _candidate_rank(candidate: CodeCandidate) -> tuple[float, float, float]:
+    metrics = _candidate_metrics(candidate)
+    # Tie-breakers are part of selection too; keep them inside the training slice.
+    return (
+        metrics.in_sample_sharpe,
+        metrics.in_sample_return,
+        metrics.in_sample_max_drawdown,
+    )
+
+
+def _candidate_metrics(candidate: CodeCandidate) -> BacktestMetrics:
+    if candidate.metrics is None:
+        raise ValueError(f"candidate {candidate.candidate_id} has no backtest metrics")
+    return candidate.metrics
+
+
+def _signal_action_count(engine_result: Any, action: str) -> int:
+    return sum(
+        1
+        for signal in getattr(engine_result, "signals", [])
+        if str(getattr(signal, "action", "")).upper().endswith(action)
+    )
+
+
+def _selection_signal_action_count(
+    engine_result: Any, rows: Sequence[Mapping[str, Any]], action: str
+) -> int:
+    dates = sorted({str(row.get("date")) for row in rows})
+    if not dates:
+        return 0
+    cutoff = dates[max(0, int(len(dates) * BACKTEST_SPLIT_FRACTION) - 1)]
+    return sum(
+        1
+        for signal in getattr(engine_result, "signals", [])
+        if str(getattr(signal, "action", "")).upper().endswith(action)
+        and str(getattr(signal, "date", "")) <= cutoff
+    )
+
+
+def _floor_metrics(result: CandidateBacktestResult) -> BacktestMetrics:
+    """The metrics the acceptance floor judges, on the period selection never saw.
+
+    Without walk-forward that is the selected candidate's own hold-out. With it, the
+    selected candidate carries the last fold's train/validation split - a split selection
+    was performed on - while the rolling evaluation is the untouched result, so the floor
+    reads the aggregate instead of a number the search already optimised against.
+    """
+
+    metrics = _candidate_metrics(result.selected_candidate)
+    aggregate = _ready_aggregate_metrics(result)
+    if aggregate is None:
+        return metrics
+    update: dict[str, Any] = {
+        "out_sample_sharpe": aggregate.out_sample_sharpe,
+        "out_sample_return": aggregate.out_sample_return,
+        "max_drawdown": aggregate.max_drawdown,
+        "selection_adjusted_sharpe": aggregate.selection_adjusted_sharpe,
+    }
+    # Benchmark comparisons belong to the same rolling evaluation as the returns above,
+    # not to the whole window the candidate was also fitted on. The aggregate carries
+    # them once it has measured them (see the walk-forward aggregation); until then the
+    # candidate's own window figures stand rather than the floor reading a blank.
+    update.update(
+        {
+            field: getattr(aggregate, field)
+            for field in _BENCHMARK_AGGREGATE_FIELDS
+            if getattr(aggregate, field) is not None
+        }
+    )
+    return metrics.model_copy(update=update)
+
+
+# Benchmark-relative fields the walk-forward aggregate owns when it fills them.
+_BENCHMARK_AGGREGATE_FIELDS = (
+    "out_sample_benchmark_return",
+    "out_sample_excess_return",
+    "benchmark_period_count",
+    "benchmark_period_win_rate",
+    "benchmark_period_loss_rate",
+    "out_sample_benchmark_period_count",
+    "out_sample_benchmark_period_win_rate",
+    "out_sample_benchmark_period_loss_rate",
+)
+
+
+def objective_floor_reasons(result: CandidateBacktestResult) -> list[str]:
+    """Every acceptance-floor check this result did not clear.
+
+    Evaluated whatever the gate mode is. A check that only runs when it blocks is a check
+    nobody can audit while it is switched off, and the verdict is published either way.
+    """
+
+    metrics = _floor_metrics(result)
+    trade_count = _summary_float_default(result.engine_summary, "effective_trade_count", 0.0)
+    reasons: list[str] = []
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        reasons.append(f"거래 수 {trade_count:g}건이 최소 {MIN_OBJECTIVE_TRADES}건에 미달합니다")
+    # This gate is a report/acceptance check, so it uses the untouched hold-out.
+    if metrics.out_sample_sharpe is None:
+        reasons.append("미사용 구간 Sharpe 를 계산하지 못했습니다")
+    elif metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        reasons.append(
+            f"미사용 구간 Sharpe {metrics.out_sample_sharpe:.2f} 가 "
+            f"기준 {MIN_OBJECTIVE_SHARPE:g} 에 미달합니다"
+        )
+    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        reasons.append(
+            f"최대 낙폭 {metrics.max_drawdown:.1%} 가 한도 {MAX_OBJECTIVE_DRAWDOWN:.0%} 를 넘습니다"
+        )
+    # A winner picked from N tries has to beat what N tries of nothing would have
+    # produced. Without this the floor passes on search width alone: six candidates
+    # trading at random cleared a +16.2% best-of-six against a -3.7% average.
+    # `candidates_evaluated` is 1 until the correction is applied, which leaves this
+    # term at in_sample_sharpe and changes no single-candidate behaviour.
+    #
+    # Under walk-forward it is published but does not gate. Each fold already picks its
+    # candidate on train/validation alone, so the rolling aggregate is an out-of-sample
+    # estimate and deflating it charges the same search twice - self-defeating, because
+    # the deflation grows with every round the floor sends the node to run. Measured:
+    # widening 3 -> 15 candidates moved the term from -1.57 to -3.19 while the
+    # out-of-sample Sharpe did not move at all, so no amount of searching could clear a
+    # floor that the searching itself lowered.
+    if _ready_aggregate_metrics(result) is None:
+        if metrics.selection_adjusted_sharpe is None:
+            reasons.append("탐색 폭 보정 Sharpe 를 계산하지 못했습니다")
+        elif metrics.selection_adjusted_sharpe < MIN_SELECTION_ADJUSTED_SHARPE:
+            reasons.append(
+                f"탐색 폭 보정 Sharpe {metrics.selection_adjusted_sharpe:.2f} 가 "
+                f"기준 {MIN_SELECTION_ADJUSTED_SHARPE:g} 에 미달합니다"
+            )
+
+    strategy = getattr(result, "strategy_a", None)
+    if getattr(strategy, "selection_mode", "standard") != "automatic":
+        return reasons
+    payload = getattr(result, "backtest_payload", {}) or {}
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    if isinstance(primary, Mapping) and primary.get("available"):
+        reasons.extend(
+            _benchmark_objective_reasons(metrics, benchmark_return=primary.get("return"))
+        )
+        return reasons
+    # This warehouse has no official KOSPI/KOSDAQ TR view, and refusing to judge on
+    # that alone made every automatic run fail on a missing data source rather than on
+    # what it earned - with no numbers to argue with. Judge against the equal-weight
+    # PIT-universe proxy instead, and say so in every reason it produced. The absence
+    # of the official series stays disclosed in ``benchmark.primary``.
+    auxiliary = benchmark.get("auxiliary") if isinstance(benchmark, Mapping) else None
+    proxy_return = auxiliary.get("return") if isinstance(auxiliary, Mapping) else None
+    if not _is_numeric_metric(proxy_return):
+        reasons.append(
+            "공식 KOSPI/KOSDAQ TR 벤치마크도, 유니버스 동일가중 프록시도 확보하지 못했습니다"
+        )
+        return reasons
+    reasons.extend(
+        f"{reason} {PROXY_BENCHMARK_JUDGEMENT_SUFFIX}"
+        for reason in _benchmark_objective_reasons(metrics, benchmark_return=proxy_return)
+    )
+    return reasons
+
+
+def _floor_metric_summary(result: CandidateBacktestResult) -> dict[str, Any]:
+    """The numbers the floor judged, published next to its verdict."""
+
+    metrics = _floor_metrics(result)
+    walk_forward = getattr(result, "walk_forward", None)
+    curve = (
+        walk_forward.equity_curve
+        if walk_forward is not None and walk_forward.equity_curve
+        else result.equity_curve
+    )
+    return {
+        "out_sample_sharpe": metrics.out_sample_sharpe,
+        "out_sample_return": metrics.out_sample_return,
+        "max_drawdown": metrics.max_drawdown,
+        "selection_adjusted_sharpe": metrics.selection_adjusted_sharpe,
+        "candidates_evaluated": metrics.candidates_evaluated,
+        "trade_count": _summary_float_default(result.engine_summary, "effective_trade_count", 0.0),
+        "evaluation_session_count": (
+            walk_forward.unique_evaluation_session_count
+            if walk_forward is not None and walk_forward.status == "ready"
+            else None
+        ),
+        "evaluation_period": ({"start": curve[0].date, "end": curve[-1].date} if curve else None),
+    }
+
+
+def _objective_floor_conclusion(
+    result: CandidateBacktestResult,
+    *,
+    reasons: Sequence[str],
+    rounds_run: int,
+    candidates_tried: int,
+) -> str:
+    """One sentence the reader can act on, whichever way the floor went.
+
+    A run that misses the floor still has to say what it found and why that is not
+    enough. Reporting "산출 안 함" for the same run that produced an equity curve and a
+    trade list is not a conclusion, it is a blank where the conclusion belongs.
+    """
+
+    summary = _floor_metric_summary(result)
+    sharpe = summary["out_sample_sharpe"]
+    numbers = " · ".join(
+        [
+            f"미사용 구간 Sharpe {sharpe:.2f}"
+            if sharpe is not None
+            else "미사용 구간 Sharpe 계산 불가",
+            f"최대 낙폭 {summary['max_drawdown']:.1%}",
+            f"거래 {summary['trade_count']:g}건",
+            f"후보 {candidates_tried}개 · 자가개선 {rounds_run}라운드",
+        ]
+    )
+    period = summary["evaluation_period"]
+    window = f"{period['start']}~{period['end']} 구간" if period else "검증 구간"
+    candidate_id = result.selected_candidate.candidate_id
+    if not reasons:
+        return f"목표 달성: 후보 {candidate_id} ({numbers}). {window}에서 수용 기준을 모두 통과했습니다."
+    return (
+        f"목표 미달: {rounds_run}라운드 {candidates_tried}후보 중 최선 후보 {candidate_id} — "
+        f"{'; '.join(reasons)}. {numbers}. "
+        f"이 규칙은 {window}에서 목표를 충족하지 못했습니다."
+    )
+
+
+def _passes_objective_floor(result: CandidateBacktestResult) -> bool:
+    """Whether the floor lets this strategy through, given the current gate mode.
+
+    In report-only mode the reasons are computed, logged, and published, but they do not
+    withhold validation. See `ai_graph.validation_gates` for why the switch exists and
+    what it deliberately does not cover.
+    """
+
+    reasons = objective_floor_reasons(result)
+    if not reasons:
+        return True
+    if objective_floor_is_enforced():
+        return False
+    _logger.info(
+        "acceptance floor not enforced; publishing as validated despite: %s",
+        "; ".join(reasons),
+    )
+    return True
+
+
+def _benchmark_objective_reasons(
+    metrics: BacktestMetrics, *, benchmark_return: float | None = None
+) -> list[str]:
+    """Why an automatic strategy failed the benchmark-relative acceptance rule.
+
+    The final lockbox checks preserve the hold-out acceptance contract. Aggregate
+    walk-forward and official-primary checks are required as well; unavailable nullable
+    values fail closed instead of being mistaken for neutral performance.
+    """
+
+    reasons: list[str] = []
+    if metrics.benchmark_period_count is None:
+        reasons.append("walk-forward benchmark aggregate is unavailable")
+    elif metrics.benchmark_period_count <= 0:
+        reasons.append(f"{BENCHMARK_EVALUATION_PERIOD_DAYS}거래일 벤치마크 비교 구간이 없습니다")
+    if metrics.out_sample_benchmark_period_count is None:
+        reasons.append("walk-forward final lockbox benchmark aggregate is unavailable")
+    elif metrics.out_sample_benchmark_period_count <= 0:
+        reasons.append(
+            f"최종 미사용 구간에 {BENCHMARK_EVALUATION_PERIOD_DAYS}거래일 벤치마크 비교 구간이 없습니다"
+        )
+    elif (
+        metrics.out_sample_benchmark_period_loss_rate is not None
+        and metrics.out_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE
+    ):
+        reasons.append(
+            "최종 미사용 구간의 벤치마크 패배 비율 "
+            f"{metrics.out_sample_benchmark_period_loss_rate:.1%} >= "
+            f"{MAX_AUTOMATIC_BENCHMARK_LOSS_RATE:.0%}"
+        )
+    if metrics.out_sample_excess_return is None:
+        reasons.append("walk-forward final lockbox excess return is unavailable")
+    elif metrics.out_sample_excess_return <= 0.0:
+        reasons.append(f"최종 미사용 구간 초과수익률 {metrics.out_sample_excess_return:.2%} <= 0%")
+    parsed_benchmark = float(benchmark_return) if _is_numeric_metric(benchmark_return) else None
+    if (
+        parsed_benchmark is None
+        and metrics.in_sample_benchmark_return is not None
+        and metrics.out_sample_benchmark_return is not None
+    ):
+        parsed_benchmark = (1.0 + metrics.in_sample_benchmark_return) * (
+            1.0 + metrics.out_sample_benchmark_return
+        ) - 1.0
+    if parsed_benchmark is None:
+        reasons.append("official benchmark aggregate is unavailable")
+    elif metrics.total_return <= parsed_benchmark:
+        reasons.append(f"전체 수익률 {metrics.total_return:.2%} <= 벤치마크 {parsed_benchmark:.2%}")
+    return reasons
+
+
+def _selected_objective_score(result: CandidateBacktestResult) -> float:
+    return result.objective_scores_by_candidate.get(
+        result.selected_candidate.candidate_id, float("-inf")
+    )
+
+
+def _objective_score(
+    metrics: BacktestMetrics,
+    engine_summary: Mapping[str, Any],
+    price_rows: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_context: _BenchmarkContext | None = None,
+) -> float:
+    trade_count = _summary_float_default(engine_summary, "selection_buy_count", 0.0)
+    selection_days = (
+        benchmark_context.selection_days
+        if benchmark_context is not None
+        else max(
+            1,
+            int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+        )
+    )
+    annual_return = _annualized_return(metrics.in_sample_return, trading_days=selection_days)
+    calmar = _calmar_ratio(annual_return, metrics.in_sample_max_drawdown)
+    if benchmark_context is None:
+        dates = sorted({str(row.get("date")) for row in price_rows})
+        cutoff = dates[max(0, selection_days - 1)] if dates else ""
+        selection_rows = [row for row in price_rows if str(row.get("date")) <= cutoff]
+        _, benchmark_return = _equal_weight_benchmark_curve(selection_rows)
+    else:
+        benchmark_return = benchmark_context.selection_return
+    annual_benchmark_return = _annualized_return(
+        float(benchmark_return or 0.0),
+        trading_days=selection_days,
+    )
+    annual_excess_return = annual_return - annual_benchmark_return
+    benchmark_consistency = float(metrics.in_sample_benchmark_period_win_rate or 0.0) - float(
+        metrics.in_sample_benchmark_period_loss_rate or 0.0
+    )
+    trading_days = selection_days
+    annual_turnover = trade_count * 252.0 / trading_days
+    turnover_penalty = _turnover_cost_penalty(annual_turnover, engine_summary)
+    # The hold-out must not affect selection.  It is only used by the objective floor
+    # after a candidate has been selected.
+    score = (
+        0.35 * metrics.in_sample_sharpe
+        + 0.15 * calmar
+        + 0.10 * annual_return
+        + 1.00 * annual_excess_return
+        + 0.20 * benchmark_consistency
+        - 0.05 * turnover_penalty
+    )
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        score -= (MIN_OBJECTIVE_TRADES - trade_count) * 0.05
+    if metrics.in_sample_max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        # Was 2x, which let a single deep drawdown swamp every other term and drove the
+        # score negative for otherwise strong candidates.
+        score -= abs(metrics.in_sample_max_drawdown - MAX_OBJECTIVE_DRAWDOWN)
+    if metrics.in_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        score -= (MIN_OBJECTIVE_SHARPE - metrics.in_sample_sharpe) * 0.25
+    if annual_return <= 0.0:
+        score -= 0.25 + abs(annual_return) * 0.5
+    if annual_excess_return <= 0.0:
+        score -= 0.35 + abs(annual_excess_return)
+    if (
+        metrics.in_sample_benchmark_period_count is not None
+        and metrics.in_sample_benchmark_period_count > 0
+        and metrics.in_sample_benchmark_period_loss_rate is not None
+        and metrics.in_sample_benchmark_period_loss_rate >= MAX_AUTOMATIC_BENCHMARK_LOSS_RATE
+    ):
+        score -= 0.25 + metrics.in_sample_benchmark_period_loss_rate
+    return round(score, METRIC_ROUND_DIGITS)
+
+
+def _annual_turnover(
+    engine_summary: Mapping[str, Any] | None, price_rows: Sequence[Mapping[str, Any]]
+) -> float:
+    """Trades a year over the selection window, which is what the cap and penalty read."""
+
+    if not engine_summary:
+        return 0.0
+    selection_days = max(
+        1,
+        int(len({str(row.get("date")) for row in price_rows}) * BACKTEST_SPLIT_FRACTION),
+    )
+    trades = _summary_float_default(engine_summary, "selection_buy_count", 0.0)
+    return trades * 252.0 / selection_days
+
+
+def _within_turnover_cap(
+    candidates: Sequence[CodeCandidate],
+    engine_summaries: Mapping[str, Mapping[str, Any]],
+    price_rows: Sequence[Mapping[str, Any]],
+) -> list[CodeCandidate]:
+    """Drop candidates that trade more than the cost model can pay for.
+
+    Pricing turnover inside the score was not enough: measured over 72 held-out test
+    years it moved the pick in 10 of them and the out-of-sample difference was noise
+    (+0.29pp, p=0.45). Refusing to select a candidate above the ceiling did move it - in
+    65 of 72 years, worth +2.38pp a year (t=2.80, p=0.007), and the effect held at nearly
+    the same size on the six markets the rule was fixed before seeing (+2.29pp search,
+    +2.48pp confirmation). It also cut the spread of what a user receives by 61%.
+
+    The ceiling is the same 24 trades a year the old saturating penalty already used as
+    its knee, so it is not a value tuned against these results.
+
+    Nothing is dropped when every candidate is over the ceiling: a turnover-heavy
+    recommendation the report can qualify beats no recommendation at all.
+    """
+
+    eligible = [
+        candidate
+        for candidate in candidates
+        if _annual_turnover(engine_summaries.get(candidate.candidate_id), price_rows)
+        <= MAX_SELECTABLE_ANNUAL_TURNOVER
+    ]
+    return eligible or list(candidates)
+
+
+def _turnover_cost_penalty(annual_turnover: float, engine_summary: Mapping[str, Any]) -> float:
+    """What a year of this candidate's trading actually costs, as a fraction of equity.
+
+    The penalty used to be `min(1, annual_turnover / 24)`, which saturates: above 24
+    trades a year it is a constant, so the objective could not tell 24 trades from 100.
+    Measured over 72 held-out test years that is exactly the range where the money goes
+    - cost drag rises with turnover at r=+1.00 while cost-free alpha does not move
+    (r=-0.12, p=0.77), so every trade past the first few is a pure subtraction. Pricing
+    turnover at the cost model the engine already charges restores the gradient, and it
+    is the model's own numbers rather than another tuned constant.
+    """
+
+    cost_model = engine_summary.get("cost_model")
+    if isinstance(cost_model, Mapping):
+        commission = _coerce_float(cost_model.get("commission_pct"), DEFAULT_COMMISSION_PCT)
+        tax = _coerce_float(cost_model.get("tax_pct"), DEFAULT_TAX_PCT)
+        slippage = _coerce_float(cost_model.get("slippage_pct"), DEFAULT_SLIPPAGE_PCT)
+    else:
+        commission, tax, slippage = (
+            DEFAULT_COMMISSION_PCT,
+            DEFAULT_TAX_PCT,
+            DEFAULT_SLIPPAGE_PCT,
+        )
+    # Buy and sell each pay commission and slippage; the transfer tax is on the sell.
+    round_trip = 2.0 * commission + tax + 2.0 * slippage
+    sizing = engine_summary.get("position_sizing")
+    positions = (
+        _coerce_float(sizing.get("max_positions"), 0.0) if isinstance(sizing, Mapping) else 0.0
+    )
+    if positions <= 0:
+        positions = float(DEFAULT_MAX_POSITIONS_FOR_COST)
+    # Each round trip turns over one slot, so one slot is 1/positions of the book.
+    return annual_turnover * round_trip / positions
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) and result >= 0.0 else default
+
+
+def _calmar_ratio(total_return: float, max_drawdown: float) -> float:
+    drawdown = abs(max_drawdown)
+    if drawdown == 0:
+        return 0.0
+    return total_return / drawdown
+
+
+def _annualized_return(
+    total_return: float,
+    price_rows: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    trading_days: int | None = None,
+) -> float:
+    effective_days = (
+        trading_days
+        if trading_days is not None
+        else len({str(row.get("date")) for row in price_rows or ()})
+    )
+    if effective_days <= 0 or total_return <= -1.0:
+        return total_return
+    return (1.0 + total_return) ** (252.0 / effective_days) - 1.0
+
+
+def _profit_factor(engine_summary: Mapping[str, Any]) -> float | None:
+    """Return realized-trade profit factor, never a period-return substitute.
+
+    The engine records gross profit and loss from closed-trade net PnL as
+    ``trade_profit_factor``. Older summaries that only have the unrelated period-return
+    metric fail closed rather than changing the meaning of the public field.
+    """
+
+    value = engine_summary.get("trade_profit_factor")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _equal_weight_benchmark_curve(
+    price_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[BacktestEquityPoint], float | None]:
+    if not price_rows:
+        return [], None
+
+    rows_by_ticker: dict[str, dict[str, float]] = defaultdict(dict)
+    for row in price_rows:
+        ticker = str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6)
+        date = str(row.get("date"))
+        close = _finite_float(row.get("close"), f"{ticker}_close")
+        if close > 0:
+            rows_by_ticker[ticker][date] = close
+
+    if not rows_by_ticker:
+        return [], None
+
+    dates = sorted({str(row.get("date")) for row in price_rows})
+    if not dates:
+        return [], None
+
+    first_date = dates[0]
+    universe = tuple(
+        sorted(ticker for ticker, rows in rows_by_ticker.items() if first_date in rows)
+    )
+    if not universe:
+        return [], None
+    universe = tuple(ticker for ticker in universe if rows_by_ticker[ticker][first_date] > 0.0)
+    if not universe:
+        return [], None
+
+    initial_prices = {ticker: rows_by_ticker[ticker][first_date] for ticker in universe}
+    latest_prices = dict(initial_prices)
+    curve: list[BacktestEquityPoint] = [BacktestEquityPoint(date=first_date, cumulative_return=0.0)]
+    for date in dates[1:]:
+        values: list[float] = []
+        for ticker in universe:
+            current = rows_by_ticker[ticker].get(date, latest_prices[ticker])
+            latest_prices[ticker] = current
+            initial_price = initial_prices[ticker]
+            if initial_price <= 0:
+                continue
+            values.append(current / initial_price)
+        if not values:
+            continue
+        cumulative_return = sum(values) / len(universe)
+        curve.append(
+            BacktestEquityPoint(
+                date=date,
+                cumulative_return=round(cumulative_return - 1.0, METRIC_ROUND_DIGITS),
+            )
+        )
+
+    if not curve:
+        return [], None
+    return curve, round(curve[-1].cumulative_return, METRIC_ROUND_DIGITS)
+
+
+def _benchmark_return(price_rows: Sequence[Mapping[str, Any]]) -> float:
+    _, total_return = _equal_weight_benchmark_curve(price_rows)
+    if total_return is None:
+        return 0.0
+    return total_return
+
+
+def _backtest_payload(
+    strategy: AIStrategySpec,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    benchmark_context: _BenchmarkContext,
+) -> dict[str, Any]:
+    tickers = sorted({str(row.get("ticker") or DEFAULT_FIXTURE_TICKER).zfill(6) for row in rows})
+    walk_forward = _walk_forward_sample(rows)
+    payload = {
+        "strategy_id": strategy.strategy_id,
+        "market": strategy.market,
+        "tickers": tickers,
+        "price_rows": len(rows),
+        "first_date": str(rows[0].get("date")) if rows else None,
+        "last_date": str(rows[-1].get("date")) if rows else None,
+        "analysis_initial_capital_krw": CANONICAL_ANALYSIS_INITIAL_CAPITAL,
+        "initial_capital_contract": "canonical_analysis_job_sealed_primary_contract",
+        "benchmark": _benchmark_provenance(benchmark_context),
+        "walk_forward_sample": _walk_forward_metadata(
+            walk_forward, _walk_forward_split_policy(rows)
+        ),
+    }
+    fingerprint = repr(sorted(payload.items())).encode("utf-8")
+    return {**payload, "payload_hash": sha256(fingerprint).hexdigest()[:16]}
+
+
+def _price_rows(
+    rows: Sequence[Mapping[str, Any]] | None,
+) -> Sequence[Mapping[str, Any]]:
+    return rows if rows is not None else DEFAULT_BACKTEST_PRICE_ROWS
+
+
+def _safe_builtins() -> dict[str, Any]:
+    return {
+        "__import__": _safe_import,
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "float": float,
+        "int": int,
+        "isinstance": isinstance,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "range": range,
+        "round": round,
+        "sorted": sorted,
+        "sum": sum,
+        "zip": zip,
+    }
+
+
+def _safe_import(
+    name: str,
+    globals_: Mapping[str, Any] | None = None,
+    locals_: Mapping[str, Any] | None = None,
+    fromlist: Sequence[str] = (),
+    level: int = 0,
+) -> Any:
+    if level != 0 or name not in ALLOWED_RUNTIME_IMPORTS:
+        raise ImportError(f"import '{name}' is not allowed in generated backtest code")
+    return __import__(name, globals_, locals_, fromlist, level)
+
+
+def _finite_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite")
+    return parsed
+
+
+def _optional_positive_float(
+    value: Any, field_name: str, *, upper_bound: float | None = None
+) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    parsed = _finite_float(value, field_name)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    if upper_bound is not None and parsed > upper_bound:
+        raise ValueError(f"{field_name} must be <= {upper_bound}")
+    return parsed
+
+
+def _summary_float(summary: Mapping[str, Any], key: str) -> float:
+    if key not in summary:
+        raise ValueError(f"engine summary missing {key}")
+    return _finite_float(summary[key], key)
+
+
+def _undefined_metric_availability(
+    metric_warnings: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, None | str]]:
+    unavailable: dict[str, dict[str, None | str]] = {}
+    for warning in metric_warnings:
+        metric = warning.get("metric")
+        # The native selection implementation writes ``reason`` while QuantStats
+        # writes ``warning``. Both mean that the advertised scalar is not measured.
+        reason = warning.get("reason") or warning.get("warning")
+        if isinstance(metric, str) and isinstance(reason, str):
+            unavailable[metric] = {"value": None, "unavailable_reason": reason}
+    return unavailable
+
+
+def _summary_float_default(summary: Mapping[str, Any], key: str, default: float) -> float:
+    if key not in summary:
+        return default
+    value = summary[key]
+    if value in (None, ""):
+        return default
+    try:
+        return _finite_float(value, key)
+    except (TypeError, ValueError):
+        return default
+
+
+def _summary_warning_list(summary: Mapping[str, Any]) -> list[dict[str, str]]:
+    warnings = summary.get("metric_warnings")
+    if isinstance(warnings, list):
+        return warnings
+    return []
+
+
+def _is_numeric_metric(value: Any) -> bool:
+    if isinstance(value, bool) or value in (None, ""):
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed)
+
+
+def _is_quantstats_dependency_error(exc: BaseException) -> bool:
+    return isinstance(exc, ModuleNotFoundError) and QUANTSTATS_REQUIRED_MESSAGE in str(exc)

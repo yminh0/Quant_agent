@@ -1,0 +1,4127 @@
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from hashlib import sha256
+from time import perf_counter
+from typing import Any, cast
+from uuid import UUID
+
+from pydantic import ValidationError
+
+from ai_graph.audit import (
+    AuditSession,
+    AuditSink,
+    NoOpAuditSink,
+    bind_audit_context,
+    create_audit_correlation,
+    report_audit_failure,
+)
+from ai_graph.audit_postgres import is_authorized_audit_session, resolve_audit_sink
+from ai_graph.data_sources import (
+    ACTIVE_DATA_SOURCE_VARIANT,
+    PipelineDataUnavailableError,
+    load_pipeline_data_from_env,
+    screening_data_families,
+)
+from ai_graph.data_sources.db import (
+    BACKTEST_EVALUATION_YEARS,
+    indicator_families_for_metrics,
+    is_release_profile,
+)
+from ai_graph.data_sources.sectors import extract_sector_from_query, get_known_sectors
+from ai_graph.envelope import InMemoryDebugStore, build_envelope
+from ai_graph.exploration_policy import (
+    ExplorationPolicyUnavailableError,
+    ExplorationPolicyV2,
+    load_exploration_policy_from_env,
+    validate_exploration_spec_against_policy,
+)
+from ai_graph.freshness import (
+    annotate_l4_coverage,
+    build_freshness_evidence,
+    freshness_status_from_metadata,
+)
+from ai_graph.llm import is_live_llm_provider
+from ai_graph.llm.role_calls import (
+    StrategyConditionsPayload,
+    generate_analyst_strategy_candidates,
+    generate_strategy_conditions,
+    resolve_strategy_intent,
+)
+from ai_graph.memory import AnalysisMemory
+from ai_graph.nodes.ambiguity import classify_query, is_small_talk
+from ai_graph.nodes.backtest import (
+    MAX_OBJECTIVE_DRAWDOWN,
+    MIN_OBJECTIVE_SHARPE,
+    MIN_OBJECTIVE_TRADES,
+    WALK_FORWARD_EVALUATION_MONTHS,
+    WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+    WALK_FORWARD_ROLL_MONTHS,
+    WALK_FORWARD_TRAIN_MONTHS,
+    WALK_FORWARD_VALIDATION_MONTHS,
+    _benchmark_objective_reasons,
+    _floor_metrics,
+    _summary_float_default,
+    backtest_node,
+)
+from ai_graph.nodes.backtest_code import backtest_code_node
+from ai_graph.nodes.backtest_features import unavailable_condition_metrics
+from ai_graph.nodes.condition_compiler import (
+    canonical_metric,
+    supported_metrics,
+    untranslatable_conditions,
+)
+from ai_graph.nodes.report import report_node
+from ai_graph.nodes.research_compile import ResearchCompileV2, compile_research
+from ai_graph.nodes.risk_manager import risk_manager_node
+from ai_graph.nodes.signal import signal_node
+from ai_graph.pipeline import AnalysisPipelineStages, ExplicitAnalysisPipeline, PipelineNode
+from ai_graph.progress import (
+    raise_if_cancelled,
+    raise_if_past_deadline,
+    report_activity,
+    report_node_stage,
+)
+from ai_graph.quant_strategy import (
+    classify_strategy_request,
+    infer_automatic_strategy_preferences,
+    robust_strategy_source_refs,
+    rsi_trade_rules,
+)
+from ai_graph.research_eligibility import PerformanceAvailable, PerformanceUnavailable
+from ai_graph.schemas import (
+    EXPLORATION_EXECUTION_SPEC_VERSION_V2,
+    RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3,
+    STRATEGY_EXECUTION_SPEC_VERSION_V1,
+    AmbiguityCode,
+    APIEnvelope,
+    BacktestMetrics,
+    CandidateBacktestResult,
+    ClarificationOption,
+    Condition,
+    ConditionOperator,
+    DataRequirement,
+    EnvelopeStatus,
+    EvidenceRef,
+    ExecutionSpecV1OrV2,
+    ExplorationExecutionSpecV2,
+    InternalPayload,
+    RecommendationGate,
+    ResearchCandidateExecutionSpecV3,
+    ScreeningMatch,
+    SemanticSlots,
+    SourceUsage,
+    StrategyCandidateCard,
+    StrategyExecutionSpecV1,
+    StrategySpec,
+    TickerAction,
+    canonical_execution_spec_digest,
+    validate_execution_spec,
+)
+from ai_graph.source_manifest import validate_release_metadata
+from ai_graph.state import QuantAgentState
+from ai_graph.strategy_blueprint_catalog import strategy_blueprint_catalog
+
+_logger = logging.getLogger(__name__)
+
+DEBUG_STORE = InMemoryDebugStore()
+NODE_SEQUENCE = (
+    "Supervisor",
+    "Ambiguity Classifier",
+    "Data",
+    "Research",
+    "BacktestCode",
+    "Backtest",
+    "Signal",
+    "Risk Manager",
+    "Report",
+)
+_NODE_ERROR_RECORDED: ContextVar[bool] = ContextVar("node_error_recorded", default=False)
+_BENCHMARK_UNAVAILABLE_REASON = (
+    "benchmark curve requires at least one non-empty trading date and valid closes"
+)
+
+_METRIC_DETAIL_KEYS = (
+    "total_return",
+    "cagr",
+    "annualized_volatility",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "max_drawdown",
+    "calmar_ratio",
+    "win_rate",
+    "profit_factor",
+    "benchmark_return",
+    "excess_return",
+    "in_sample_sharpe",
+    "out_sample_sharpe",
+    "degradation",
+)
+_RELIABILITY_WARN_UNTIL_DAYS = 30
+_RELIABILITY_SUFFICIENT_DAYS = 90
+_RELIABILITY_MIN_TICKERS = 2
+_UNAVAILABLE_METRIC_REASON = "benchmark cannot be calculated from current data"
+
+
+def build_graph(audit_session: AuditSession | None = None) -> ExplicitAnalysisPipeline:
+    """Build the one explicit analysis pipeline.
+
+    This function keeps its historical name so callers do not need to migrate,
+    but it no longer selects a different runtime based on whether LangGraph is
+    installed.  All branches now share the same inspectable state machine.
+    """
+
+    stages = AnalysisPipelineStages(
+        supervisor=supervisor_node,
+        ambiguity=ambiguity_classifier_node,
+        data=data_node,
+        research=research_node,
+        # These handlers predate the explicit TypedDict boundary and still annotate
+        # their input as a plain dict.  They receive the same state at runtime; the
+        # cast records that compatibility boundary in one place while each handler is
+        # migrated independently.
+        backtest_code=cast(PipelineNode, backtest_code_node),
+        backtest=cast(PipelineNode, backtest_node),
+        signal=cast(PipelineNode, signal_node),
+        risk_manager=cast(PipelineNode, risk_manager_node),
+        report=cast(PipelineNode, report_node),
+        envelope=envelope_node,
+        route_after_ambiguity=_route_after_ambiguity,
+        route_after_data=_route_after_data,
+        route_after_research=_route_after_research,
+    )
+
+    def invoke_stage(
+        name: str,
+        node: PipelineNode,
+        state: QuantAgentState,
+    ) -> QuantAgentState | dict[str, Any]:
+        return instrument_node(audit_session, name, node)(state)
+
+    return ExplicitAnalysisPipeline(stages, invoke_stage=invoke_stage)
+
+
+def run_analysis(
+    user_query: str,
+    trace_id: str | None = None,
+    *,
+    audit_sink: AuditSink | None = None,
+    audit_session: AuditSession | None = None,
+    audit_entrypoint: str = "graph.run_analysis",
+    audit_feature: str = "analysis",
+    strategy_id: str | None = None,
+    client_request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    execution_spec: ExecutionSpecV1OrV2 | Mapping[str, Any] | None = None,
+    execution_spec_hash: str | None = None,
+) -> APIEnvelope:
+    base_report_started_at = perf_counter()
+    query = _normalize_user_query(user_query)
+    normalized_execution_spec = (
+        validate_execution_spec(execution_spec) if execution_spec is not None else None
+    )
+    exploration_policy = None
+    if isinstance(normalized_execution_spec, ExplorationExecutionSpecV2):
+        sealed_policy = load_exploration_policy_from_env(normalized_execution_spec.policy_version)
+        validate_exploration_spec_against_policy(normalized_execution_spec, sealed_policy)
+        validation = sealed_policy.policy.validation
+        if (
+            validation.train_months,
+            validation.validation_months,
+            validation.evaluation_months,
+            validation.roll_months,
+            validation.minimum_evaluation_sessions,
+            sealed_policy.policy.history_years,
+        ) != (
+            WALK_FORWARD_TRAIN_MONTHS,
+            WALK_FORWARD_VALIDATION_MONTHS,
+            WALK_FORWARD_EVALUATION_MONTHS,
+            WALK_FORWARD_ROLL_MONTHS,
+            WALK_FORWARD_MIN_UNIQUE_EVALUATION_SESSIONS,
+            BACKTEST_EVALUATION_YEARS,
+        ):
+            raise ExplorationPolicyUnavailableError("exploration_policy_engine_version_stale")
+        exploration_policy = sealed_policy.policy
+    if normalized_execution_spec is not None:
+        expected_hash = canonical_execution_spec_digest(normalized_execution_spec)
+        if execution_spec_hash is not None and execution_spec_hash != expected_hash:
+            raise ValueError("execution spec hash does not match the confirmed contract")
+    resolved_trace_id = trace_id or (_trace_id(query) if query else None)
+    if audit_session is not None and not is_authorized_audit_session(audit_session):
+        report_audit_failure("unapproved_audit_session")
+        audit_session = None
+        audit_sink = NoOpAuditSink()
+    session = audit_session or _open_audit_session(
+        audit_sink,
+        trace_id=resolved_trace_id,
+        debug_ref=None,
+        entrypoint=audit_entrypoint,
+        feature=audit_feature,
+        strategy_id=strategy_id,
+        client_request_id=client_request_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if not query:
+        _record_error(
+            session,
+            "analysis_input_validation",
+            error_type="ValueError",
+            message="ValueError raised during analysis input validation",
+        )
+        _record_finalization(
+            session, "failed", message="analysis execution failed before graph invocation"
+        )
+        raise ValueError("user_query must not be empty")
+    _record_step(session, "analysis_started", message="analysis execution started")
+    node_error_token = _NODE_ERROR_RECORDED.set(False)
+    try:
+        state = build_graph(audit_session=session).invoke(
+            {
+                "user_query": query,
+                "trace_id": resolved_trace_id or "",
+                **(
+                    {"execution_spec": normalized_execution_spec.model_dump(mode="json")}
+                    if normalized_execution_spec is not None
+                    else {}
+                ),
+                **(
+                    {"exploration_policy": exploration_policy.model_dump(mode="json")}
+                    if exploration_policy is not None
+                    else {}
+                ),
+                "base_report_started_at": base_report_started_at,
+            }
+        )
+        envelope = APIEnvelope.model_validate(state["envelope"])
+    except Exception as exc:
+        if not _NODE_ERROR_RECORDED.get():
+            _record_error(
+                session,
+                "analysis_execution",
+                error_type=type(exc).__name__,
+                message=f"{type(exc).__name__} raised during analysis execution",
+            )
+        _record_finalization(session, "failed", message="analysis execution failed")
+        raise
+    finally:
+        _NODE_ERROR_RECORDED.reset(node_error_token)
+    status_label = envelope.status.value
+    _record_step(session, "analysis_completed", message=f"analysis returned status={status_label}")
+    _record_finalization(
+        session,
+        _finalization_status_for_envelope(envelope),
+        message=f"analysis completed with status={status_label}",
+        metadata_jsonb={"debug_ref": envelope.debug_ref, "public_trace_id": envelope.trace_id},
+    )
+    return envelope
+
+
+def instrument_node(
+    session: AuditSession | None,
+    name: str,
+    node: Callable[[QuantAgentState], QuantAgentState | dict[str, Any]],
+) -> Callable[[QuantAgentState], QuantAgentState | dict[str, Any]]:
+    def wrapped(state: QuantAgentState) -> QuantAgentState | dict[str, Any]:
+        # Node boundaries are the checkpoints: a cancelled run, or one that has spent
+        # its whole time budget, stops here rather than paying for the remaining nodes.
+        raise_if_cancelled()
+        raise_if_past_deadline()
+        # Announce the stage before the node runs so a polling client sees the work
+        # it is actually waiting on, not the stage it already finished.
+        report_node_stage(name)
+        if session is None:
+            return node(state)
+
+        execution_id = _start_agent_execution(session, name, state)
+        started = perf_counter()
+        try:
+            with bind_audit_context(session, execution_id):
+                result = node(state)
+        except Exception as exc:
+            latency_ms = (perf_counter() - started) * 1_000
+            _finish_agent_execution(
+                session,
+                execution_id,
+                status="failed",
+                output_jsonb={},
+                error_message=f"{type(exc).__name__} raised during {name}",
+                latency_ms=latency_ms,
+            )
+            _record_error(
+                session,
+                name,
+                error_type=type(exc).__name__,
+                message=f"{type(exc).__name__} raised during graph node execution",
+                execution_id=execution_id,
+            )
+            _NODE_ERROR_RECORDED.set(True)
+            raise
+        _finish_agent_execution(
+            session,
+            execution_id,
+            status="succeeded",
+            output_jsonb=_safe_state_metadata(result),
+            latency_ms=(perf_counter() - started) * 1_000,
+        )
+        return result
+
+    return wrapped
+
+
+def _start_agent_execution(
+    session: AuditSession,
+    name: str,
+    state: Mapping[str, Any],
+) -> UUID | None:
+    try:
+        return session.start_agent_execution(
+            name,
+            step_name=name,
+            input_jsonb=_safe_state_metadata(state),
+        )
+    except Exception:
+        report_audit_failure("start_agent_execution")
+        return None
+
+
+def _finish_agent_execution(
+    session: AuditSession,
+    execution_id: UUID | None,
+    *,
+    status: str,
+    output_jsonb: Mapping[str, Any],
+    error_message: str | None = None,
+    latency_ms: float,
+) -> None:
+    if execution_id is None:
+        return
+    try:
+        session.finish_agent_execution(
+            execution_id,
+            status=status,
+            output_jsonb=output_jsonb,
+            error_message=error_message,
+            latency_ms=latency_ms,
+        )
+    except Exception:
+        report_audit_failure("finish_agent_execution")
+
+
+def _safe_state_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"keys": sorted(str(key) for key in value)}
+    for key in ("route", "status", "trace_id"):
+        candidate = value.get(key)
+        if isinstance(candidate, (str, int, float, bool)):
+            metadata[key] = str(candidate)[:128]
+    return metadata
+
+
+# The interpreting stage covers Supervisor -> Ambiguity -> Data and can run for minutes,
+# but only the screening pipeline inside Data reported anything. Everything before it sat
+# behind a single "전략 해석 중" label with an empty activity log, which reads as a hang.
+def supervisor_node(state: QuantAgentState) -> QuantAgentState:
+    prepared = _prepare_supervisor_state(
+        str(state.get("user_query", "")),
+        trace_id=state.get("trace_id") or None,
+    )
+    report_activity(
+        "step", label="요청 접수", detail=_activity_query_preview(prepared["user_query"])
+    )
+    return {**state, **prepared}
+
+
+_ACTIVITY_QUERY_PREVIEW_LIMIT = 120
+
+
+def _activity_query_preview(query: str) -> str:
+    text = str(query).strip()
+    if len(text) <= _ACTIVITY_QUERY_PREVIEW_LIMIT:
+        return text
+    return f"{text[:_ACTIVITY_QUERY_PREVIEW_LIMIT]}…"
+
+
+def _prepare_supervisor_state(user_query: str, *, trace_id: str | None) -> QuantAgentState:
+    query = _normalize_user_query(user_query)
+    if not query:
+        raise ValueError("user_query must not be empty")
+    resolved_trace_id = trace_id or _trace_id(query)
+    return {
+        "user_query": query,
+        "trace_id": resolved_trace_id,
+        "debug_ref": f"debug:{resolved_trace_id}",
+        "route": "strategy_parse",
+        "internal_payload": InternalPayload(trace_id=resolved_trace_id).model_dump(),
+    }
+
+
+def _normalize_user_query(user_query: str) -> str:
+    return " ".join(str(user_query).split())
+
+
+def _open_audit_session(
+    audit_sink: AuditSink | None,
+    *,
+    trace_id: str | None,
+    debug_ref: str | None,
+    entrypoint: str,
+    feature: str,
+    strategy_id: str | None = None,
+    client_request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> AuditSession:
+    correlation = create_audit_correlation(
+        trace_id=trace_id,
+        debug_ref=debug_ref,
+        entrypoint=entrypoint,
+        feature=feature,
+        strategy_id=strategy_id,
+        client_request_id=client_request_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    sink = resolve_audit_sink(audit_sink)
+    try:
+        return sink.open_session(correlation)
+    except Exception:
+        report_audit_failure("open_session")
+        return NoOpAuditSink().open_session(correlation)
+
+
+def _record_step(session: AuditSession, step: str, *, message: str | None = None) -> None:
+    try:
+        session.record_step(step, message=message)
+    except Exception:
+        report_audit_failure("record_step")
+
+
+def _record_error(
+    session: AuditSession,
+    step: str,
+    *,
+    error_type: str,
+    message: str,
+    execution_id: UUID | None = None,
+) -> None:
+    try:
+        session.record_error(
+            step,
+            error_type=error_type,
+            message=message,
+            execution_id=execution_id,
+        )
+    except Exception:
+        report_audit_failure("record_error")
+
+
+def _record_finalization(
+    session: AuditSession,
+    status: str,
+    *,
+    message: str | None = None,
+    metadata_jsonb: Mapping[str, Any] | None = None,
+) -> None:
+    try:
+        session.record_finalization(status, message=message, metadata_jsonb=metadata_jsonb)
+    except Exception:
+        report_audit_failure("record_finalization")
+
+
+def _finalization_status_for_envelope(envelope: APIEnvelope) -> str:
+    return "failed" if envelope.status == EnvelopeStatus.FAILED else "completed"
+
+
+def ambiguity_classifier_node(state: QuantAgentState) -> dict[str, Any]:
+    """Resolve what to run, rather than judge whether the input was good enough.
+
+    An underspecified request used to end the analysis in a question: "저평가주 사줘"
+    or "네가 알아서 설정해" was pattern-matched as missing a market/rule/risk level and
+    came back asking for one. That reads as a refusal, and the user asked for the
+    strategy precisely because they did not want to specify it. So the vagueness is
+    resolved once, here, by a model that can web-search current market conditions and
+    commit to concrete numbers - every later stage reads `resolved_query` and never
+    sees that the request started out vague. What still stops a run: a message that is
+    not asking for a strategy at all, and an asset class the warehouse cannot price.
+    """
+
+    query = state["user_query"]
+    if is_small_talk(query):
+        return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=None)
+    if state.get("execution_spec"):
+        sealed_execution_spec = validate_execution_spec(state["execution_spec"])
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3):
+            candidate = sealed_execution_spec.candidates[0]
+            return _ambiguity_state(
+                AmbiguityCode.READY,
+                query,
+                intent={
+                    "scope": "strategy",
+                    "resolved_query": query,
+                    "interpretation": "AI 리서치로 봉인한 실행 조건을 적용합니다.",
+                    "backtest_years": candidate.backtest_years,
+                    "backtest_period_basis": candidate.backtest_period_basis,
+                    "selection_source": "sealed_spec",
+                },
+            )
+        if isinstance(sealed_execution_spec, ExplorationExecutionSpecV2):
+            # The sealed exploration policy already fixes the history window, the
+            # universe and the risk controls, so there is nothing left for the intent
+            # model to decide. Calling it anyway made every catalogue run depend on one
+            # more web-grounded AOAI round trip - production job_50d2c2c0a625 died right
+            # here on a read timeout before a single bar was loaded.
+            years = _exploration_history_years(state)
+            return _ambiguity_state(
+                AmbiguityCode.READY,
+                query,
+                intent={
+                    "scope": "strategy",
+                    "resolved_query": query,
+                    "interpretation": "사전등록 카탈로그 후보군을 봉인된 탐색 정책으로 비교합니다.",
+                    "backtest_years": years,
+                    "backtest_period_basis": (
+                        f"봉인된 탐색 정책의 검증 창(history_years={years})을 그대로 적용"
+                    ),
+                    "selection_source": "sealed_spec",
+                },
+            )
+        # A legacy confirmed rule seals entry/exit only.  It still needs the same
+        # one-time AI period selection before the data loader can run.
+        intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
+        if intent is not None and intent["scope"] == "unsupported":
+            # A confirmed rule does not override the asset-class gate: the model's
+            # refusal used to be discarded here and the run went on to backtest an
+            # asset the warehouse cannot price.
+            return _ambiguity_state(AmbiguityCode.INFEASIBLE, query, intent=intent)
+        if intent is not None:
+            intent = {**intent, "resolved_query": query}
+        report_activity(
+            "step", label="요청 해석 완료", detail="사용자가 확인한 실행 조건을 적용합니다."
+        )
+        return _ambiguity_state(
+            AmbiguityCode.READY,
+            query,
+            intent=intent,
+        )
+    report_activity("step", label="요청 해석", detail="입력을 실행 가능한 전략으로 구체화하는 중")
+    intent = resolve_strategy_intent(query=query, capabilities=data_source_inventory())
+    if intent is None:
+        # Without a model decision this can still be classified as a stock request,
+        # but it cannot reach the loader: data_node requires a sealed period first.
+        return _ambiguity_state(classify_query(query), query, intent=None)
+    if intent["scope"] == "not_a_request":
+        return _ambiguity_state(AmbiguityCode.NO_STRATEGY_INTENT, query, intent=intent)
+    if intent["scope"] == "unsupported":
+        return _ambiguity_state(AmbiguityCode.INFEASIBLE, query, intent=intent)
+    return _ambiguity_state(AmbiguityCode.READY, query, intent=intent)
+
+
+def _ambiguity_state(
+    category: AmbiguityCode,
+    query: str,
+    *,
+    intent: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    status = _status_for_category(category)
+    clarification = build_clarification_prompt(category, query)
+    assumptions = [str(item) for item in (intent or {}).get("assumptions", []) if str(item).strip()]
+    reason = str((intent or {}).get("scope_reason") or "").strip() or _ambiguity_reason(category)
+    ambiguity = {
+        "category": category.value,
+        "ambiguity_category": category.value,
+        "safety_priority": category == AmbiguityCode.INFEASIBLE,
+        "reason": reason if category != AmbiguityCode.READY else _ambiguity_reason(category),
+        "ambiguity_reasons": _ambiguity_reasons(category, query),
+        "ambiguity_dimensions": _ambiguity_dimensions(category, query),
+        "source_resolvable": category
+        in {AmbiguityCode.INPUT_AMBIGUOUS, AmbiguityCode.TERM_UNKNOWN},
+        "needs_clarification_after_source_check": category
+        not in {
+            AmbiguityCode.READY,
+            AmbiguityCode.NO_STRATEGY_INTENT,
+        },
+        "clarification_blocker_type": _clarification_blocker_type(category),
+        "clarification_question": clarification["question"],
+        "question_reason": clarification["question_reason"],
+        "options": [option.model_dump() for option in clarification["options"]],
+        "recommended_option": clarification["recommended"],
+        "recommendation_confidence": clarification["confidence"],
+        "recommendation_confidence_reason": clarification["confidence_reason"],
+        "interpretation": str((intent or {}).get("interpretation") or ""),
+        "assumptions": assumptions,
+        "citations": list((intent or {}).get("citations") or []),
+    }
+    output: dict[str, Any] = {"ambiguity": ambiguity, "status": status.value}
+    if intent is not None:
+        output["intent"] = dict(intent)
+    if category == AmbiguityCode.READY and intent is not None:
+        output["resolved_query"] = str(intent["resolved_query"])
+        try:
+            output["backtest_period"] = _backtest_period_from_intent(
+                intent, selection_source=_intent_period_source(intent)
+            )
+        except ValueError:
+            # Keep the malformed payload for a typed data-node failure.  This makes
+            # the failure occur before the loader, rather than hiding it behind an
+            # arbitrary local/mock default.
+            pass
+
+    if category == AmbiguityCode.READY:
+        detail = str((intent or {}).get("interpretation") or "").strip()
+        if assumptions:
+            detail = f"{detail} / 정한 조건: {' '.join(assumptions[:2])}".strip(" /")
+        report_activity(
+            "step",
+            label="요청 해석 완료",
+            detail=(detail or "입력한 조건 그대로 진행합니다.")[:200],
+        )
+    else:
+        report_activity("step", label="요청 해석 완료", detail=f"진행할 수 없는 요청: {reason}")
+    return output
+
+
+def _rule_provenance(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """What the backtest reported about the rule it traded, if it ran at all."""
+
+    backtest = state.get("backtest")
+    if not isinstance(backtest, Mapping) or not backtest:
+        return None
+    from ai_graph.nodes.backtest import rule_provenance
+
+    spec = state.get("strategy_spec") or {}
+    return rule_provenance(
+        backtest,
+        spec.get("entry_conditions"),
+        selection_mode=spec.get("selection_mode"),
+    )
+
+
+def _strategy_query(state: Mapping[str, Any]) -> str:
+    """The strategy every stage after the interpreter works on.
+
+    Falls back to the raw input only when nothing resolved it, so a stage never has to
+    know whether the user spelled the strategy out or the interpreter did.
+    """
+
+    return str(state.get("resolved_query") or state.get("user_query") or "")
+
+
+# Who chose the history window. Only the first two are model decisions; data_node
+# refuses anything else under a release profile so a fixture period can never be
+# recorded as research.
+_MODEL_SELECTED_PERIOD_SOURCES = frozenset({"ai_research", "sealed_spec"})
+
+
+def _intent_period_source(intent: Mapping[str, Any]) -> str:
+    explicit = str(intent.get("selection_source") or "").strip()
+    if explicit:
+        return explicit
+    return "ai_research" if is_live_llm_provider() else "mock_fixture"
+
+
+def _backtest_period_from_intent(
+    intent: Mapping[str, Any], *, selection_source: str = "ai_research"
+) -> dict[str, Any]:
+    years = intent.get("backtest_years")
+    if isinstance(years, bool) or not isinstance(years, int) or not 1 <= years <= 5:
+        raise ValueError("AI가 백테스트 기간을 1~5년 정수로 확정하지 못했습니다.")
+    basis = str(intent.get("backtest_period_basis") or intent.get("basis") or "").strip()
+    if not basis:
+        raise ValueError("AI가 선택한 백테스트 기간의 근거를 제공하지 않았습니다.")
+    return {
+        "backtest_years": years,
+        "selection_source": selection_source,
+        "period_locked": True,
+        "basis": basis,
+    }
+
+
+def _exploration_history_years(state: Mapping[str, Any]) -> int:
+    """The history window a sealed exploration run uses: the policy's, never a model's."""
+
+    policy = state.get("exploration_policy")
+    if isinstance(policy, Mapping):
+        years = policy.get("history_years")
+        if isinstance(years, int) and not isinstance(years, bool) and 1 <= years <= 5:
+            return years
+    raise ValueError(
+        "봉인된 탐색 정책에 검증 창(history_years)이 없어 백테스트 기간을 정할 수 없습니다."
+    )
+
+
+def _backtest_period_for_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the only history-window decision permitted before data access."""
+
+    existing = state.get("backtest_period")
+    if isinstance(existing, Mapping):
+        try:
+            period = _backtest_period_from_intent(
+                existing,
+                selection_source=str(existing.get("selection_source") or "ai_research"),
+            )
+        except ValueError:
+            period = None
+        if period is not None and existing.get("period_locked") is True:
+            return period
+    execution_spec = state.get("execution_spec")
+    if execution_spec is not None:
+        sealed = validate_execution_spec(execution_spec)
+        if isinstance(sealed, ResearchCandidateExecutionSpecV3):
+            candidate = sealed.candidates[0]
+            return _backtest_period_from_intent(
+                {
+                    "backtest_years": candidate.backtest_years,
+                    "backtest_period_basis": candidate.backtest_period_basis,
+                },
+                selection_source="sealed_spec",
+            )
+        if isinstance(sealed, ExplorationExecutionSpecV2):
+            years = _exploration_history_years(state)
+            return _backtest_period_from_intent(
+                {
+                    "backtest_years": years,
+                    "backtest_period_basis": (
+                        f"봉인된 탐색 정책의 검증 창(history_years={years})을 그대로 적용"
+                    ),
+                },
+                selection_source="sealed_spec",
+            )
+    intent = state.get("intent")
+    if isinstance(intent, Mapping):
+        return _backtest_period_from_intent(intent, selection_source=_intent_period_source(intent))
+    raise ValueError("AI가 백테스트 기간을 확정하지 못했습니다. 다시 시도해 주세요.")
+
+
+def data_node(state: QuantAgentState) -> dict[str, Any]:
+    query = _strategy_query(state)
+    try:
+        backtest_period = _backtest_period_for_state(state)
+    except ValueError as exc:
+        message = str(exc)
+        return {
+            "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+            "ambiguity": {
+                "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+                "reason": message,
+                "ambiguity_reasons": [message],
+            },
+        }
+    semantic_slots = parse_semantic_slots(query, trace_id=state["trace_id"])
+    data_requirements = _data_requirements_from_sealed_spec(
+        state.get("execution_spec"),
+        fallback=plan_data_requirements(semantic_slots, query=query),
+    )
+    if not data_requirements:
+        # An empty plan means we could not name a single thing to read, so there is
+        # nothing to screen on and nothing a later stage could honestly verify. It used
+        # to be reported as "0종" and then ignored - the run continued into a full
+        # backtest whose data no stage had claimed to need. Stop here with a reason
+        # instead.
+        return {
+            "semantic_slots": semantic_slots.model_dump(),
+            "data_requirements": [],
+            "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+            "ambiguity": _no_data_plan_ambiguity(query),
+        }
+    report_activity(
+        "step",
+        label="필요 데이터 정리",
+        detail=f"조회할 데이터 항목 {len(data_requirements)}종을 확정했습니다.",
+    )
+    exploration = bool(state.get("exploration_policy"))
+    sealed_execution_spec = (
+        validate_execution_spec(state["execution_spec"])
+        if state.get("execution_spec") is not None
+        else None
+    )
+    # A current-date screener is presentation enrichment; it is not part of the
+    # historical PIT universe or the sealed rule that the backtest executes.  Running
+    # it alongside the full historical extraction made a researched broad-universe
+    # request spend two expensive PostgreSQL reads before it could produce a report.
+    # Keep it off the V3 execution critical path.  The report still derives its signal
+    # and ticker actions from the sealed rule and the terminal PostgreSQL snapshot.
+    skip_current_screen = exploration or isinstance(
+        sealed_execution_spec, ResearchCandidateExecutionSpecV3
+    )
+    required_metrics = _sealed_condition_metrics(sealed_execution_spec)
+    # A sealed sector is a universe constraint, not a condition: it restricts PIT
+    # membership before any rule runs. Read from the spec rather than re-derived from
+    # the query so the backtest trades exactly the universe research resolved.
+    sealed_sector = (
+        sealed_execution_spec.candidates[0].sector
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+        else None
+    )
+    # Same contract for a named index (KOSPI200): point-in-time constituents restrict
+    # the universe, and only a spec the research node sealed can ask for it.
+    sealed_index_universe = (
+        sealed_execution_spec.candidates[0].index_universe
+        if isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+        else None
+    )
+    if (
+        is_release_profile()
+        and backtest_period["selection_source"] not in _MODEL_SELECTED_PERIOD_SOURCES
+    ):
+        # A mock/fixture period is sealed and labelled in non-release profiles so the
+        # deterministic pipeline runs end to end; a release profile must never read
+        # history for a window no model researched.
+        raise PipelineDataUnavailableError(
+            "production_period_source_forbidden",
+            "운영 환경에서는 AI가 리서치로 선택한 백테스트 기간만 사용할 수 있습니다. "
+            "실제 LLM 제공자 설정을 확인해 주세요.",
+        )
+    if is_release_profile() and ACTIVE_DATA_SOURCE_VARIANT != "db":
+        raise PipelineDataUnavailableError(
+            "production_data_source_variant_forbidden",
+            "운영 환경에서는 검증된 PostgreSQL data source variant(db)만 사용할 수 있습니다.",
+        )
+    selected_backtest_years = backtest_period["backtest_years"]
+    selected_backtest_period_basis = backtest_period["basis"]
+    if required_metrics is not None:
+        requires_financials = bool(required_metrics & _FUNDAMENTAL_CONDITION_METRICS)
+        # Only a sealed V3 price-path plan may take the OHLCV-only projection.  V1
+        # executes on raw prices and its report reads the full frame.
+        compact_price_rows = (
+            isinstance(sealed_execution_spec, ResearchCandidateExecutionSpecV3)
+            and not requires_financials
+            and not indicator_families_for_metrics(
+                tuple(sorted(required_metrics)), include_default=False
+            )
+        )
+        pipeline_data = load_pipeline_data_from_env(
+            query,
+            state["trace_id"],
+            screen_current=not skip_current_screen,
+            required_metrics=tuple(sorted(required_metrics)),
+            requires_financials=requires_financials,
+            compact_price_rows=compact_price_rows,
+            sector=sealed_sector,
+            index_universe=sealed_index_universe,
+            backtest_lookback_years=selected_backtest_years,
+            period_locked=True,
+        )
+    elif skip_current_screen:
+        pipeline_data = load_pipeline_data_from_env(
+            query,
+            state["trace_id"],
+            screen_current=False,
+            sector=sealed_sector,
+            index_universe=sealed_index_universe,
+            backtest_lookback_years=selected_backtest_years,
+            period_locked=True,
+        )
+    else:
+        pipeline_data = load_pipeline_data_from_env(
+            query,
+            state["trace_id"],
+            backtest_lookback_years=selected_backtest_years,
+            period_locked=True,
+        )
+    if selected_backtest_years is not None:
+        pipeline_data = pipeline_data.model_copy(
+            update={
+                "metadata": {
+                    **pipeline_data.metadata,
+                    "backtest_period": {
+                        "years": selected_backtest_years,
+                        "selection_source": backtest_period["selection_source"],
+                        "basis": selected_backtest_period_basis,
+                        "locked": True,
+                    },
+                }
+            }
+        )
+    if is_release_profile() and pipeline_data.metadata.get("source") != "postgres":
+        raise PipelineDataUnavailableError(
+            "production_postgres_required",
+            "운영 환경에서는 PostgreSQL 데이터가 확인된 경우에만 분석을 진행할 수 있습니다.",
+        )
+    missing_required_families = _missing_required_indicator_families(
+        required_metrics,
+        pipeline_data.metadata,
+    )
+    if missing_required_families:
+        raise PipelineDataUnavailableError(
+            "required_indicator_data_unavailable",
+            "필수 기술지표 데이터가 없어 분석을 진행할 수 없습니다: "
+            + ", ".join(missing_required_families),
+        )
+    pipeline_metadata = dict(pipeline_data.metadata)
+    pipeline_metadata.setdefault("data_source_variant", ACTIVE_DATA_SOURCE_VARIANT)
+    pipeline_metadata.setdefault("data_node_contract", "data-node-v2")
+    timings = pipeline_metadata.get("timings")
+    if isinstance(timings, Mapping):
+        report_activity(
+            "step",
+            label="데이터 조회 완료",
+            detail=(
+                f"{pipeline_metadata.get('price_rows', len(pipeline_data.price_rows))}개 가격 행을 "
+                f"{float(timings.get('total_seconds', 0.0)):.2f}초에 확인했습니다."
+            ),
+        )
+    # A source-backed exact-rule block is deliberately returned without price rows or
+    # a source manifest: validating it as a completed extract would hide the real
+    # reason the backtest did not run. The pre-screen capability blocker follows the
+    # same contract.
+    stopped_before_execution = bool(
+        pipeline_metadata.get("stopped_before_screening")
+        or pipeline_metadata.get("stopped_before_backtest")
+    )
+    if is_release_profile() and not stopped_before_execution:
+        manifest_errors = validate_release_metadata(
+            pipeline_metadata,
+            loaded_extract_hash=(
+                str(pipeline_data.metadata["loaded_extract_hash"])
+                if pipeline_data.metadata.get("loaded_extract_hash") is not None
+                else None
+            ),
+        )
+        if manifest_errors:
+            raise PipelineDataUnavailableError(
+                "release_source_manifest_invalid",
+                "release source manifest is invalid: " + "; ".join(manifest_errors),
+            )
+    source_usage = build_source_usage(
+        query,
+        data_requirements,
+        trace_id=state["trace_id"],
+        pipeline_metadata=pipeline_metadata,
+    )
+    evidence_refs = build_evidence_refs(source_usage, trace_id=state["trace_id"])
+    candidate_research_as_of = datetime.now(UTC).isoformat()
+    researched_cards = generate_analyst_strategy_candidates(
+        query=query,
+        research_as_of=candidate_research_as_of,
+        allowed_metrics=supported_metrics(),
+        loaded_analyst_evidence=pipeline_data.l4_evidence,
+    )
+    cards = strategy_candidate_cards(
+        researched_cards,
+        screening_candidates=pipeline_data.current_screen_candidates,
+        sector=semantic_slots.sector,
+    )
+    freshness_evidence = annotate_l4_coverage(
+        build_freshness_evidence(pipeline_metadata),
+        l4_evidence=pipeline_data.l4_evidence,
+        tickers=pipeline_data.metadata.get("l4_evidence_tickers") or (),
+    )
+    output: dict[str, Any] = {
+        "semantic_slots": semantic_slots.model_dump(),
+        "data_requirements": [requirement.model_dump() for requirement in data_requirements],
+        "source_usage": [usage.model_dump() for usage in source_usage],
+        "evidence_refs": [evidence.model_dump() for evidence in evidence_refs],
+        "freshness_status": _aggregate_freshness_status(source_usage),
+        "freshness_evidence": freshness_evidence.model_dump(),
+        "proxy_disclosure": _proxy_disclosure(data_requirements),
+        "data": {
+            "candidate_cards": [card.model_dump() for card in cards],
+            "candidate_research_as_of": candidate_research_as_of,
+            "pipeline_data_source": pipeline_metadata,
+            "screening_candidates": pipeline_data.current_screen_candidates,
+            "relaxed_screening_candidates": pipeline_data.relaxed_screening_candidates,
+            "historical_backtest_universe": pipeline_data.historical_backtest_universe,
+            "data_availability": pipeline_data.data_availability,
+            "data_source_inventory": data_source_inventory(),
+        },
+    }
+    if pipeline_data.price_rows:
+        output["price_rows"] = pipeline_data.price_rows
+    if pipeline_metadata.get("source") == "postgres" or pipeline_data.l4_evidence:
+        output["l4_evidence"] = pipeline_data.l4_evidence
+    if pipeline_data.macro_snapshot:
+        output["macro_snapshot"] = pipeline_data.macro_snapshot
+    if pipeline_data.official_benchmark is not None:
+        output["official_benchmark"] = pipeline_data.official_benchmark
+
+    # Stop rather than screen on whatever data happens to exist. Conditions we cannot
+    # evaluate used to fall through to a price-only profile, so a flow or short-interest
+    # strategy came back with a full report built from unrelated names - a result that
+    # reads as verified but never tested what the user asked for.
+    unsupported = pipeline_data.data_availability.get("unsupported_capabilities") or []
+    if unsupported:
+        output["status"] = EnvelopeStatus.NEED_CLARIFICATION.value
+        output["ambiguity"] = _unverifiable_ambiguity(unsupported)
+    return output
+
+
+def _missing_required_indicator_families(
+    required_metrics: Sequence[str] | None,
+    pipeline_metadata: Mapping[str, Any],
+) -> list[str]:
+    """Return required indicator families that the loader could not provide."""
+
+    if required_metrics is None:
+        return []
+    required_families = set(
+        indicator_families_for_metrics(tuple(sorted(required_metrics)), include_default=False)
+    )
+    unavailable_families = {
+        str(item) for item in pipeline_metadata.get("unavailable_indicator_families", ())
+    }
+    return sorted(required_families & unavailable_families)
+
+
+_FUNDAMENTAL_CONDITION_METRICS = frozenset(
+    # `per` belongs here even though it is priced per bar: its EPS comes from the same
+    # DART filings, so a per-only rule still has to load them.
+    {"roe", "debt_to_equity", "operating_margin", "operating_income", "revenue", "per"}
+)
+
+
+def _sealed_condition_metrics(spec: object) -> set[str] | None:
+    """Every metric a sealed spec's conditions evaluate, or None when there is no plan.
+
+    A V1 spec is what the production FE path seals for an explicit rule ("RSI 30 이하
+    매수"), and it was reaching the loader with no plan at all - so an RSI rule loaded all
+    four TA families and every DART filing for the whole universe before backtesting a
+    single momentum column.  Its conditions name their metrics as concretely as V3's AST
+    does; there is no reason to read them any less precisely.
+    """
+
+    if isinstance(spec, ResearchCandidateExecutionSpecV3):
+        return _sealed_v3_condition_metrics(spec)
+    if isinstance(spec, StrategyExecutionSpecV1):
+        return {
+            canonical_metric(condition.metric)
+            for condition in [*spec.entry_conditions, *spec.exit_conditions]
+        }
+    return None
+
+
+def _sealed_v3_condition_metrics(spec: ResearchCandidateExecutionSpecV3) -> set[str]:
+    """Return every metric the sealed V3 AST actually evaluates.
+
+    The model's ``required_metrics`` summary is useful documentation, but it must not
+    be allowed to omit an operand that the compiler will later use.  The data loader
+    receives this concrete set so a relative-strength rule does not load unrelated
+    RSI, volatility, volume, and DART histories before backtesting.
+    """
+
+    metrics = {
+        canonical_metric(metric)
+        for candidate in spec.candidates
+        for metric in candidate.required_metrics
+    }
+    for candidate in spec.candidates:
+        for condition in [*candidate.entry_conditions, *candidate.exit_conditions]:
+            metrics.add(canonical_metric(condition.left))
+            if isinstance(condition.right, str):
+                metrics.add(canonical_metric(condition.right))
+    return metrics
+
+
+def _data_requirements_from_sealed_spec(
+    raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2 | None,
+    *,
+    fallback: list[DataRequirement],
+) -> list[DataRequirement]:
+    """Derive V3 data needs from its sealed IR, not raw keyword matching.
+
+    The V3 researcher can resolve a Korean term that does not occur in the old slot
+    table.  Letting the raw sentence decide the loader would make the data plan disagree
+    with the rule that is subsequently compiled and backtested.
+    """
+
+    if raw_spec is None:
+        return fallback
+    spec = validate_execution_spec(raw_spec)
+    if not isinstance(spec, ResearchCandidateExecutionSpecV3):
+        return fallback
+    metrics = _sealed_v3_condition_metrics(spec)
+    requirements: list[DataRequirement] = []
+    technical_metrics = metrics - {
+        "roe",
+        "debt_to_equity",
+        "operating_margin",
+        "operating_income",
+        "revenue",
+    }
+    if technical_metrics:
+        requirements.append(
+            DataRequirement(
+                family="ohlcv_ta",
+                availability="available",
+                owner="ai_graph",
+                preferred_source="internal_db",
+                fallback_sources=["krx"],
+                freshness_requirement="same_trading_day",
+                source_confidence_floor=0.85,
+                evidence_ref="data-plan:v3-ohlcv-ta",
+            )
+        )
+    if metrics & _FUNDAMENTAL_CONDITION_METRICS:
+        requirements.append(
+            DataRequirement(
+                family="fundamentals",
+                availability="outside_owner",
+                owner="product_data_gap",
+                preferred_source="dart",
+                fallback_sources=[],
+                freshness_requirement="report_period",
+                source_confidence_floor=0.75,
+                evidence_ref="data-plan:v3-fundamentals",
+            )
+        )
+    return requirements
+
+
+def _no_data_plan_ambiguity(query: str) -> dict[str, Any]:
+    reason = "요청에서 조회할 데이터 항목을 하나도 확정하지 못했습니다."
+    return {
+        "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "ambiguity_category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "safety_priority": False,
+        "reason": reason,
+        "ambiguity_reasons": [reason],
+        "ambiguity_dimensions": ["data_availability"],
+        "source_resolvable": False,
+        "needs_clarification_after_source_check": True,
+        "clarification_blocker_type": "missing_data_source",
+        "clarification_question": (
+            "어떤 지표로 종목을 고를지 알 수 없어 조회할 데이터를 정하지 못했습니다. "
+            "기준으로 삼을 지표를 하나만 정해 주시겠어요?"
+        ),
+        "question_reason": "조회할 데이터가 없으면 어떤 조건도 검증할 수 없습니다.",
+        "options": [
+            {
+                "label": "가격/기술적 지표 기준으로 검증",
+                "reason": "이동평균·RSI·거래량 같은 가격 지표는 지금 바로 검증할 수 있습니다.",
+            },
+            {
+                "label": "재무 지표 기준으로 검증",
+                "reason": "PER·ROE·부채비율 같은 재무 조건으로 종목을 고를 수 있습니다.",
+            },
+        ],
+        "recommended_option": 0,
+        "recommendation_confidence": 0.6,
+        "recommendation_confidence_reason": "가격/기술적 지표는 적재 상태가 가장 안정적입니다.",
+    }
+
+
+def _unverifiable_ambiguity(unsupported: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    labels = [str(item.get("label")) for item in unsupported]
+    reasons = [f"{item.get('label')}: {item.get('reason')}" for item in unsupported]
+    joined = ", ".join(labels)
+    return {
+        "category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "ambiguity_category": AmbiguityCode.INPUT_AMBIGUOUS.value,
+        "safety_priority": False,
+        "reason": (
+            f"현재 서버에는 {joined} 데이터를 계산할 수 있는 자료가 연결되지 않아, "
+            "이 조건을 포함한 원래 규칙 그대로는 백테스트할 수 없습니다."
+        ),
+        "ambiguity_reasons": reasons,
+        "ambiguity_dimensions": ["data_availability"],
+        "source_resolvable": False,
+        "needs_clarification_after_source_check": True,
+        "clarification_blocker_type": "missing_data_source",
+        "clarification_question": (
+            f"{joined} 조건에 필요한 데이터가 현재 서버에 없습니다. 조건을 임의로 빼거나 "
+            "다른 지표로 바꾸지 않고, 원래 규칙은 그대로 보류했습니다."
+        ),
+        "question_reason": "원래 규칙을 바꾸면 그 결과는 사용자가 요청한 전략의 검증이 아닙니다.",
+        # ClarificationOption takes label and reason only, and forbids extras - the
+        # envelope validates these, so an option shaped any other way turns an honest
+        # refusal into a failed analysis.
+        "options": [
+            {
+                "label": "원래 규칙 유지",
+                "reason": "필요한 데이터가 연결되면 같은 규칙으로 백테스트할 수 있습니다.",
+            },
+            {
+                "label": "별도 탐색 가설 만들기",
+                "reason": "원래 규칙과 분리해, 지금 데이터로 검증 가능한 새 가설을 만들 수 있습니다.",
+            },
+        ],
+        # An index into options, not a label - UserPayload.recommended is int|None.
+        "recommended_option": 0,
+        "recommendation_confidence": 1.0,
+        "recommendation_confidence_reason": "원래 규칙을 유지해야 검증 대상이 바뀌지 않습니다.",
+    }
+
+
+# Which risk policy a researched rule falls back to when the research response did not
+# state one, keyed by the metric family its entry conditions read. Measured on five
+# years of PIT KRX data ("$SP/diag" prod_rules_grid, 48 combinations): loosening the
+# stop from 8% to 25% moved an RSI mean-reversion rule from -38.3% to +51.3%, while the
+# same change made a momentum rotation rule worse (-61.3% -> -80.6%). The sign of the
+# lever flips with the family, so one hardcoded number is wrong for half of them.
+# Matching is by substring against the entry metric names, first family wins.
+_RESEARCH_RISK_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Mean-reversion, value, quality and low-volatility rules buy what has already
+    # fallen, or hold a slow fundamental thesis. A tight stop sells them inside exactly
+    # the drawdown they were bought for, so the stop here is a disaster stop only.
+    (
+        "defensive",
+        (
+            "rsi",
+            "stoch",
+            "williams",
+            "cci",
+            "zscore",
+            "bollinger",
+            "mfi",
+            "return_5d",
+            "drawdown",
+            "loss_streak",
+            "ulcer",
+            "per",
+            "pbr",
+            "eps",
+            "dividend",
+            "earnings",
+            "roe",
+            "operating_margin",
+            "operating_income",
+            "revenue",
+            "debt_to_equity",
+            "up_streak",
+            "growth_streak",
+            "volatility",
+        ),
+    ),
+    # Cross-sectional momentum and rotation: a stop is what limits the crash, and
+    # concentration is where the premium is.
+    (
+        "momentum",
+        (
+            "momentum",
+            "relative_strength",
+            "return_",
+            "sharpe_",
+            "sortino_",
+            "price_volume_score",
+            "close_to_high",
+            "r_squared",
+        ),
+    ),
+)
+# Trend crossovers (SMA/EMA/MACD/ADX) and anything unrecognised. Trend entries are
+# already late entries, so 8% catches ordinary pullbacks; 15% does not.
+_RESEARCH_RISK_DEFAULT_FAMILY = "trend"
+_RESEARCH_RISK_DEFAULTS: dict[str, tuple[float, float, int]] = {
+    # family: (stop_loss_pct, trailing_stop_pct, max_positions)
+    "defensive": (0.25, 0.30, 20),
+    "momentum": (0.15, 0.25, 10),
+    "trend": (0.15, 0.25, 15),
+}
+_RESEARCH_RISK_FAMILY_LABELS = {
+    "defensive": "평균회귀·가치·퀄리티·저변동",
+    "momentum": "모멘텀·로테이션",
+    "trend": "추세 교차",
+}
+# The engine's ceiling, i.e. no profit target. The old 0.45 default truncated the right
+# tail of every researched trend rule that never asked for a profit target.
+RESEARCH_TAKE_PROFIT_DISABLED = 10.0
+
+
+def _position_pct_for(max_positions: int) -> float:
+    """Encode "hold N names" as the ``max_position_pct`` the sizing helpers decode.
+
+    ``requested_max_positions`` reads it back as ``ceil(1 / pct)``, and plain
+    ``1.0 / n`` lands just *below* the true fraction for many n (1/7, 1/9, 1/12,
+    1/14 ...), so the round trip silently returned n + 1 names. Take the next float
+    up, which is never below the exact fraction.
+    """
+
+    return min(1.0, math.nextafter(1.0 / max_positions, math.inf))
+
+
+def _research_risk_family(candidate: Any) -> str:
+    """Which metric family a researched rule's entry conditions belong to."""
+
+    names: list[str] = []
+    for condition in candidate.entry_conditions:
+        names.append(str(getattr(condition, "left", "")).lower())
+        right = getattr(condition, "right", None)
+        if isinstance(right, str):
+            names.append(right.lower())
+    if not any(names):
+        names = [str(metric).lower() for metric in candidate.required_metrics]
+    for family, markers in _RESEARCH_RISK_FAMILY_MARKERS:
+        if any(marker in name for name in names for marker in markers):
+            return family
+    return _RESEARCH_RISK_DEFAULT_FAMILY
+
+
+def _research_risk_policy(candidate: Any) -> tuple[dict[str, float], list[str]]:
+    """The researched rule's risk controls, plus what had to be assumed for it.
+
+    The rule states its own stop/trailing/target/concentration when the research node
+    resolved them; every value it left unset takes the family default above and is
+    disclosed, so nothing is silently chosen for the user. All of it is fixed before a
+    single return is read.
+    """
+
+    family = _research_risk_family(candidate)
+    default_stop, default_trailing, default_positions = _RESEARCH_RISK_DEFAULTS[family]
+    stop = candidate.stop_loss_pct
+    trailing = candidate.trailing_stop_pct
+    take_profit = candidate.take_profit_pct
+    positions = candidate.max_positions
+    constraints = {
+        "max_position_pct": _position_pct_for(positions or default_positions),
+        "stop_loss_pct": float(stop if stop is not None else default_stop),
+        "trailing_stop_pct": float(trailing if trailing is not None else default_trailing),
+        "take_profit_pct": float(
+            take_profit if take_profit is not None else RESEARCH_TAKE_PROFIT_DISABLED
+        ),
+    }
+    assumed = [
+        label
+        for value, label in (
+            (stop, f"손절 {constraints['stop_loss_pct']:.0%}"),
+            (trailing, f"고점 대비 추적손절 {constraints['trailing_stop_pct']:.0%}"),
+            (
+                take_profit,
+                "익절 미설정(사실상 해제)"
+                if take_profit is None
+                else f"익절 {constraints['take_profit_pct']:.0%}",
+            ),
+            (positions, f"최대 {positions or default_positions}종목"),
+        )
+        if value is None
+    ]
+    stated = [
+        label
+        for value, label in (
+            (stop, f"손절 {constraints['stop_loss_pct']:.0%}"),
+            (trailing, f"고점 대비 추적손절 {constraints['trailing_stop_pct']:.0%}"),
+            (take_profit, f"익절 {constraints['take_profit_pct']:.0%}"),
+            (positions, f"최대 {positions}종목"),
+        )
+        if value is not None
+    ]
+    notes: list[str] = []
+    if stated:
+        notes.append("리서치가 지정한 리스크 정책: " + ", ".join(stated))
+    if assumed:
+        notes.append(
+            f"리서치가 값을 제시하지 않아 진입 지표 계열"
+            f"({_RESEARCH_RISK_FAMILY_LABELS[family]})의 기본값을 적용: " + ", ".join(assumed)
+        )
+    return constraints, notes
+
+
+def _strategy_spec_from_execution_spec(
+    raw_spec: Mapping[str, Any] | ExecutionSpecV1OrV2,
+    raw_policy: Mapping[str, Any] | None = None,
+    *,
+    backtest_years: int | None = None,
+) -> StrategySpec:
+    """Compile the confirmed rule without asking another model to reinterpret it."""
+
+    execution_spec = validate_execution_spec(raw_spec)
+    if isinstance(execution_spec, ResearchCandidateExecutionSpecV3):
+        candidate = execution_spec.candidates[0]
+        risk_policy, risk_notes = _research_risk_policy(candidate)
+        return StrategySpec(
+            strategy_id=f"researched_{canonical_execution_spec_digest(execution_spec)[:12]}",
+            name=candidate.title,
+            market=execution_spec.market,
+            timeframe=execution_spec.timeframe,
+            backtest_years=candidate.backtest_years,
+            entry_conditions=candidate.entry_conditions,
+            exit_conditions=candidate.exit_conditions,
+            indicators=list(dict.fromkeys(candidate.required_metrics)),
+            risk_constraints={
+                **risk_policy,
+                "research_snapshot_hash": execution_spec.research_snapshot_hash,
+                "research_capability_hash": execution_spec.capability_hash,
+                "research_candidate_id": candidate.candidate_id,
+                # The sealed rule's time exit and rebalance cadence travel with the
+                # other execution constraints; backtest_code reads them back into the
+                # StrategyIR and CandidateParameters the engine actually runs.
+                **(
+                    {"holding_days": candidate.holding_days}
+                    if candidate.holding_days is not None
+                    else {}
+                ),
+                **(
+                    {"rebalance_interval_days": candidate.rebalance_interval_days}
+                    if candidate.rebalance_interval_days is not None
+                    else {}
+                ),
+            },
+            assumptions=[
+                *candidate.assumptions,
+                "AI 웹 리서치로 전략 의미를 정규화하고, 조건과 근거를 성과 조회 전에 봉인함",
+                f"반대 가설: {candidate.counter_hypothesis}",
+                *risk_notes,
+            ],
+            source_refs=[source.url for source in execution_spec.sources],
+            selection_mode="user_defined",
+            confidence=1.0,
+        )
+    if isinstance(execution_spec, ExplorationExecutionSpecV2):
+        if raw_policy is None:
+            raise ValueError("exploration policy payload is required")
+        policy = ExplorationPolicyV2.model_validate(raw_policy)
+        templates_by_id = {item.catalog_id: item for item in strategy_blueprint_catalog()}
+        templates = [templates_by_id[item.catalog_id] for item in execution_spec.candidates]
+        first = templates[0]
+        return StrategySpec(
+            strategy_id=f"exploration_{canonical_execution_spec_digest(execution_spec)[:12]}",
+            name="사전등록 후보군 탐색 연구",
+            market=execution_spec.market,
+            timeframe=execution_spec.timeframe,
+            backtest_years=backtest_years,
+            entry_conditions=first.entry_conditions,
+            exit_conditions=first.exit_conditions,
+            indicators=list(
+                dict.fromkeys(key for template in templates for key in template.required_data)
+            ),
+            risk_constraints={
+                "max_position_pct": round(1.0 / policy.max_positions, 8),
+                "stop_loss_pct": policy.stop_loss_pct,
+                "take_profit_pct": policy.take_profit_pct,
+                "trailing_stop_pct": policy.trailing_stop_pct,
+                "rebalance_interval_days": policy.rebalance_interval_days,
+                "strategy_style": policy.risk_style,
+                "investment_horizon": policy.investment_horizon,
+                "sealed_candidate_ids": ",".join(
+                    item.catalog_id for item in execution_spec.candidates
+                ),
+                "sealed_candidate_signatures": ",".join(
+                    item.execution_signature for item in execution_spec.candidates
+                ),
+                "exploration_policy_version": policy.policy_version,
+                "exploration_policy_hash": execution_spec.policy_hash,
+                "commission_pct": policy.cost_model.commission_pct,
+                "tax_pct": policy.cost_model.tax_pct,
+                "slippage_pct": policy.cost_model.slippage_pct,
+            },
+            assumptions=[
+                "성과 조회 전에 정책과 후보군을 고정함",
+                "모든 후보에 같은 PIT 데이터, 비용, 검증 구간을 적용함",
+                "개인별 매매 추천이 아닌 과거 데이터 연구임",
+            ],
+            source_refs=[policy.catalog_version, policy.policy_version],
+            selection_mode="automatic",
+            confidence=1.0,
+        )
+
+    execution_spec = StrategyExecutionSpecV1.model_validate(execution_spec)
+
+    def condition_from_contract(item: Any) -> Condition:
+        metric = canonical_metric(item.metric)
+        return Condition(
+            left=metric,
+            operator=ConditionOperator(item.comparator),
+            right=item.value,
+            description=f"{item.metric} {item.comparator} {item.value:g} (lookback {item.lookback})",
+        )
+
+    entry_conditions = [condition_from_contract(item) for item in execution_spec.entry_conditions]
+    exit_conditions = [condition_from_contract(item) for item in execution_spec.exit_conditions]
+    indicators = list(
+        dict.fromkeys(
+            canonical_metric(item.metric)
+            for item in [*execution_spec.entry_conditions, *execution_spec.exit_conditions]
+        )
+    )
+    return StrategySpec(
+        strategy_id=f"parsed_{canonical_execution_spec_digest(execution_spec)[:12]}",
+        name="사용자 확인 전략",
+        market=execution_spec.market,
+        timeframe=execution_spec.timeframe,
+        backtest_years=backtest_years,
+        entry_conditions=entry_conditions,
+        exit_conditions=exit_conditions,
+        indicators=indicators,
+        risk_constraints={"max_position_pct": 0.1, "stop_loss_pct": 0.08},
+        assumptions=["사용자가 확인한 구조화 실행 조건을 그대로 적용"],
+        source_refs=[STRATEGY_EXECUTION_SPEC_VERSION_V1],
+        selection_mode="user_defined",
+        confidence=1.0,
+    )
+
+
+def research_node(state: QuantAgentState) -> dict[str, Any]:
+    """Compile the strategy and its one bounded AI interpretation.
+
+    The structured ResearchCompileV2 call is explanatory only: the confirmed execution
+    contract remains the sole source of entry/exit conditions for the compiler.
+    """
+
+    confirmed_spec = state.get("execution_spec")
+    backtest_years = _backtest_period_for_state(state)["backtest_years"]
+    if confirmed_spec:
+        strategy_a = _strategy_spec_from_execution_spec(
+            confirmed_spec,
+            state.get("exploration_policy"),
+            backtest_years=backtest_years,
+        )
+    else:
+        strategy_a = build_strategy_spec(
+            _strategy_query(state),
+            variant="A",
+            semantic_slots=state.get("semantic_slots"),
+            original_query=state.get("user_query"),
+            backtest_years=backtest_years,
+        )
+
+    # If the screen already expressed the rule as structured conditions, adopt them as
+    # the spec's entry/exit conditions. That makes the screen and the spec one
+    # definition instead of two independently-derived ones - the drift this whole change
+    # is about. The spec's other fields (indicators, risk) stay as built.
+    screening = state.get("data", {}).get("pipeline_data_source", {}) or {}
+    relaxation = screening.get("screening_relaxation") or {}
+    screen_entry = relaxation.get("entry_conditions") or []
+    screen_exit = relaxation.get("exit_conditions") or []
+    if screen_entry and strategy_a.selection_mode != "automatic" and not confirmed_spec:
+        try:
+            strategy_a = strategy_a.model_copy(
+                update={
+                    "entry_conditions": [Condition.model_validate(c) for c in screen_entry],
+                    "exit_conditions": [Condition.model_validate(c) for c in screen_exit],
+                    "assumptions": [
+                        *strategy_a.assumptions,
+                        "entry/exit 조건을 스크리닝 SQL과 동일한 구조 정의로 통일함",
+                    ],
+                }
+            )
+        except ValidationError:
+            _logger.warning("screening conditions failed spec validation; keeping built spec")
+
+    sealed_spec = validate_execution_spec(confirmed_spec) if confirmed_spec else None
+    if isinstance(sealed_spec, ResearchCandidateExecutionSpecV3):
+        unsupported = [
+            *untranslatable_conditions(strategy_a.entry_conditions),
+            *untranslatable_conditions(
+                strategy_a.exit_conditions,
+                allow_rank_filters=False,
+            ),
+        ]
+        if unsupported:
+            missing = [
+                {
+                    "label": label,
+                    "reason": "현재 구조화 백테스트 엔진이 이 조건을 같은 규칙으로 계산하지 못합니다.",
+                }
+                for label in dict.fromkeys(unsupported)
+            ]
+            return {
+                "original_strategy_spec": strategy_a.model_dump(),
+                "strategy_spec": strategy_a.model_dump(),
+                "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+                "ambiguity": _unverifiable_ambiguity(missing),
+            }
+
+    if isinstance(sealed_spec, ResearchCandidateExecutionSpecV3):
+        candidate = sealed_spec.candidates[0]
+        missing_metrics = unavailable_condition_metrics(
+            state.get("price_rows") or [],
+            [*candidate.entry_conditions, *candidate.exit_conditions],
+        )
+        if missing_metrics:
+            missing = [
+                {
+                    "label": metric,
+                    "reason": "봉인된 전략 조건에 필요한 과거 PIT 지표가 분석 구간에 없습니다.",
+                }
+                for metric in missing_metrics
+            ]
+            return {
+                "original_strategy_spec": strategy_a.model_dump(),
+                "strategy_spec": strategy_a.model_dump(),
+                "status": EnvelopeStatus.NEED_CLARIFICATION.value,
+                "ambiguity": _unverifiable_ambiguity(missing),
+            }
+        research_compile: dict[str, Any] = {
+            "provider": "aoai",
+            "interpretation": sealed_spec.resolution_summary,
+            "economic_rationale": candidate.economic_rationale,
+            "supporting_rationale": [source.claim for source in sealed_spec.sources],
+            "counterpoints": [candidate.counter_hypothesis],
+            "pre_falsification_conditions": candidate.falsification_conditions,
+            # The risk policy actually run travels with the other pre-backtest
+            # assumptions, whether research chose it or the family default did.
+            "ai_assumptions": [
+                *candidate.ai_assumptions,
+                *_research_risk_policy(candidate)[1],
+            ],
+            "expected_holding_period": (
+                f"{candidate.holding_days} 거래일"
+                if candidate.holding_days is not None
+                else "조건 기반 청산"
+            ),
+            "expected_turnover": candidate.expected_turnover,
+            "regime_risks": candidate.regime_risks,
+            "backtest_period": {
+                "years": candidate.backtest_years,
+                "basis": candidate.backtest_period_basis,
+                "selection_source": "ai_research",
+            },
+            "limitations": [
+                "웹 리서치는 전략 용어와 가설의 근거이며 성과 수치는 PostgreSQL 백테스트만 사용합니다.",
+                "봉인 뒤에는 연구 결과가 진입·종료 조건을 바꾸지 않습니다.",
+                *[source.limitation for source in sealed_spec.sources],
+            ],
+        }
+        research_sources = [
+            {
+                "title": source.title,
+                "url": source.url,
+                "claim": source.claim,
+                "limitation": source.limitation,
+            }
+            for source in sealed_spec.sources
+        ]
+    elif isinstance(sealed_spec, ExplorationExecutionSpecV2):
+        research_compile = _exploration_research_compile(sealed_spec).model_dump()
+        research_sources = _exploration_research_sources(sealed_spec)
+    else:
+        research_compile = compile_research(
+            query=str(state.get("user_query") or ""),
+            strategy=strategy_a,
+            data=state.get("data"),
+        ).model_dump()
+        research_sources = []
+    return {
+        "original_strategy_spec": strategy_a.model_dump(),
+        "strategy_spec": strategy_a.model_dump(),
+        "research_compile": research_compile,
+        "research_sources": research_sources,
+    }
+
+
+def _exploration_templates(spec: ExplorationExecutionSpecV2) -> list[Any]:
+    templates_by_id = {item.catalog_id: item for item in strategy_blueprint_catalog()}
+    return [
+        templates_by_id[candidate.catalog_id]
+        for candidate in spec.candidates
+        if candidate.catalog_id in templates_by_id
+    ]
+
+
+def _exploration_research_compile(spec: ExplorationExecutionSpecV2) -> ResearchCompileV2:
+    """The reader-facing interpretation of a sealed catalogue run, without a model call.
+
+    The generic explanatory call (`compile_research`, 700 output tokens) was made for
+    the exploration spec as well, and three catalogue formulas overflowed it - AOAI
+    answered `response.incomplete: max_output_tokens` and the whole job failed at
+    code_generation before a single bar was read (production job_b524f001d0fa).
+    Every catalogue row already carries a source-backed explanation, a formula and its
+    caveats, so nothing here needs a model; the deterministic text says as much.
+    """
+
+    templates = _exploration_templates(spec)
+    titles = ", ".join(item.title for item in templates) or "사전등록 후보"
+    interpretation = (
+        f"사전등록 후보 {len(templates)}개({titles})를 같은 PIT 데이터·비용·검증 구간에서 "
+        "비교합니다. 후보와 정책은 성과를 보기 전에 봉인됐고, 성과를 본 뒤 후보를 바꾸지 않습니다."
+    )
+    supporting = [f"{item.title}: {item.why_used}" for item in templates][:4]
+    counterpoints = [f"{item.title}: {item.caveats[0]}" for item in templates if item.caveats][:4]
+    return ResearchCompileV2(
+        provider="deterministic",
+        interpretation=interpretation[:600],
+        supporting_rationale=supporting
+        or ["후보는 출처가 있는 카탈로그 정의에서 그대로 가져옵니다."],
+        counterpoints=counterpoints
+        or ["어느 후보도 충분한 미래 구간 근거를 만들지 못할 수 있습니다."],
+        limitations=[
+            "과거 성과는 미래 수익이나 원금 보전을 보장하지 않습니다.",
+            "설명은 카탈로그의 출처 기반 정의에서 가져왔고 이 실행에서는 AI 해석 호출을 하지 않았습니다.",
+            "성과 수치와 비용은 PostgreSQL 백테스트 결과가 준비된 뒤에만 표시합니다.",
+        ],
+    )
+
+
+def _exploration_research_sources(spec: ExplorationExecutionSpecV2) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for item in _exploration_templates(spec):
+        for url in item.source_refs:
+            sources.append(
+                {
+                    "title": item.title,
+                    "url": url,
+                    "claim": item.plain_explanation,
+                    "limitation": item.caveats[0] if item.caveats else "",
+                }
+            )
+    return sources
+
+
+def envelope_node(state: QuantAgentState) -> dict[str, Any]:
+    status = EnvelopeStatus(state["status"])
+    report = state.get("report")
+    cards = [
+        StrategyCandidateCard.model_validate(card)
+        for card in state.get("data", {}).get("candidate_cards", [])
+    ]
+    exact_rule_blocked = (
+        state.get("ambiguity", {}).get("clarification_blocker_type") == "missing_data_source"
+    )
+    if status == EnvelopeStatus.READY:
+        exploration = bool(state.get("exploration_policy"))
+        performance = project_public_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        gate = _recommendation_gate(state, performance=performance)
+        validated = gate is None or gate.validated
+        payload = {
+            "headline": (
+                "탐색 연구가 완료되었습니다."
+                if exploration
+                else "전략 분석이 완료되었습니다."
+                if validated
+                else "전략이 백테스트 검증을 통과하지 못했습니다."
+            ),
+            "message": _ready_message(state, validated=validated),
+            "next_actions": [
+                "web_projection 확인",
+                "email_projection 예약",
+                "실거래 전 데이터 어댑터 연결",
+                *_availability_next_actions(state.get("data", {}).get("data_availability", {})),
+                *_freshness_next_actions(state.get("freshness_evidence")),
+            ],
+            "candidate_cards": cards,
+            "report": report,
+            "performance": performance,
+            "recommendation_gate": None if exploration else gate,
+            "ticker_actions": []
+            if exploration
+            else _ticker_actions(
+                state,
+                cards,
+                performance=performance,
+                recommendation_gate=gate,
+            ),
+        }
+    elif state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
+        clarification = _clarification_from_ambiguity(state["ambiguity"])
+        payload = {
+            "headline": "전략 입력을 기다리고 있습니다.",
+            "message": state["ambiguity"]["reason"],
+            "next_actions": ["예: RSI가 30 이하일 때 매수하고 70 이상일 때 매도"],
+            "candidate_cards": [],
+            **clarification,
+        }
+    elif status == EnvelopeStatus.REJECTED:
+        clarification = _clarification_from_ambiguity(state["ambiguity"])
+        payload = {
+            "headline": "MVP 범위 밖 전략입니다.",
+            "message": state["ambiguity"]["reason"],
+            "next_actions": ["KRX 현물 주식 전략으로 다시 입력"],
+            "candidate_cards": cards,
+            **clarification,
+        }
+    else:
+        clarification = _clarification_from_ambiguity(state["ambiguity"])
+        payload = {
+            "headline": "추가 확인이 필요합니다.",
+            "message": state["ambiguity"]["reason"],
+            "next_actions": (
+                ["원래 조건 유지", "검증 가능한 별도 탐색 가설 만들기"]
+                if exact_rule_blocked
+                else (
+                    ["후보 카드 중 하나 선택", "시장/기간/조건 보강"]
+                    if cards
+                    else ["시장/기간/조건 보강", "근거가 충분하면 다시 분석"]
+                )
+            ),
+            "candidate_cards": [] if exact_rule_blocked else cards,
+            **clarification,
+        }
+    internal = build_internal_payload(state)
+    DEBUG_STORE.put(state["debug_ref"], internal)
+    execution_spec = (
+        validate_execution_spec(state["execution_spec"]) if state.get("execution_spec") else None
+    )
+    envelope = build_envelope(
+        status=status,
+        trace_id=state["trace_id"],
+        debug_ref=state["debug_ref"],
+        user_payload=payload,
+        strategy_spec=state.get("strategy_spec"),
+        execution_spec=execution_spec,
+        execution_spec_version=(
+            (
+                EXPLORATION_EXECUTION_SPEC_VERSION_V2
+                if isinstance(execution_spec, ExplorationExecutionSpecV2)
+                else RESEARCH_CANDIDATE_EXECUTION_SPEC_VERSION_V3
+                if isinstance(execution_spec, ResearchCandidateExecutionSpecV3)
+                else STRATEGY_EXECUTION_SPEC_VERSION_V1
+            )
+            if execution_spec is not None
+            else None
+        ),
+        execution_spec_hash=(
+            canonical_execution_spec_digest(execution_spec) if execution_spec is not None else None
+        ),
+        retryable=status in {EnvelopeStatus.NEED_CLARIFICATION, EnvelopeStatus.FAILED},
+        semantic_slots=state.get("semantic_slots"),
+        data_requirements=state.get("data_requirements"),
+        source_usage=state.get("source_usage"),
+        freshness_status=state.get("freshness_status"),
+        freshness_evidence=state.get("freshness_evidence"),
+        proxy_disclosure=state.get("proxy_disclosure"),
+        failure_cause=state.get("failure_cause"),
+        evidence_refs=state.get("evidence_refs"),
+        rule_provenance=_rule_provenance(state),
+    )
+    _record_analysis_memory(state, status)
+    return {"envelope": envelope.model_dump()}
+
+
+def _ready_message(state: QuantAgentState, *, validated: bool) -> str:
+    """What ran, plus what the interpreter decided in the user's place.
+
+    The choices it made are disclosed on the result rather than asked about up front -
+    the user sees the strategy they got and exactly which parts of it they did not
+    specify, instead of being stopped at a form.
+    """
+
+    if state.get("exploration_policy"):
+        return (
+            "사전등록 후보 전체를 같은 PostgreSQL 데이터, 비용, 미래 구간 방식으로 검증했습니다. "
+            "현재 매매 지시가 아니라 과거 조건 관측 결과입니다."
+        )
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        base = "freshness 한계로 추천을 생성하지 않았습니다. 아래 결과는 검토용입니다."
+    else:
+        base = (
+            "StrategySpec, 후보 코드 백테스트, 신호, 리스크, 리포트를 생성했습니다."
+            if validated
+            else "백테스트 목표 기준에 못 미쳐 아래 종목은 추천이 아닌 참고용입니다."
+        )
+    sections = [base, *_objective_floor_conclusion(state), *_universe_split_disclosure(state)]
+    ambiguity = state.get("ambiguity") or {}
+    assumptions = [
+        str(item).strip() for item in ambiguity.get("assumptions", []) if str(item).strip()
+    ]
+    if assumptions:
+        listed = "\n".join(f"- {item}" for item in assumptions[:5])
+        sections.append(f"지정하지 않으신 부분은 이렇게 정해서 진행했습니다:\n{listed}")
+    return "\n\n".join(sections)
+
+
+def _objective_floor_conclusion(state: QuantAgentState) -> list[str]:
+    """The acceptance floor's verdict, in the message rather than only in the report."""
+
+    floor = state.get("objective_floor") or {}
+    if not isinstance(floor, Mapping):
+        return []
+    conclusion = str(floor.get("conclusion") or "").strip()
+    return [conclusion] if conclusion else []
+
+
+def _universe_split_disclosure(state: QuantAgentState) -> list[str]:
+    """Explain any point-in-time universe split between testing and screening."""
+
+    pipeline = state.get("data", {}).get("pipeline_data_source") or {}
+    descriptor = pipeline.get("backtest_universe") if isinstance(pipeline, Mapping) else None
+    if not isinstance(descriptor, Mapping):
+        return []
+    lines = [
+        (
+            "백테스트는 과거 시점(PIT) 기준 유니버스로 규칙 자체를 검증하고, "
+            "아래 종목은 같은 규칙을 오늘 데이터에 적용한 결과입니다. "
+            "두 목록이 서로 다른 것은 정상입니다."
+        )
+    ]
+    excluded = descriptor.get("excluded_screening_candidate_count")
+    if isinstance(excluded, int) and not isinstance(excluded, bool) and excluded > 0:
+        lines.append(
+            f"오늘 스크리닝 후보 중 {excluded}종목은 백테스트 구간의 과거 시점 유니버스에 없어 "
+            "백테스트 거래 대상에서 제외됐습니다."
+        )
+    return lines
+
+
+def parse_semantic_slots(query: str, *, trace_id: str) -> SemanticSlots:
+    lowered = query.lower()
+    indicator: list[str] = []
+    threshold: list[str] = []
+    lookback: list[str] = []
+    horizon: list[str] = []
+    price_basis: list[str] = []
+    event: list[str] = []
+    action: list[str] = []
+    missing_slots: list[str] = []
+    contradictions: list[str] = []
+
+    if "rsi" in lowered or "과매도" in query:
+        indicator.append("rsi")
+    if "볼린저" in query or "bollinger" in lowered:
+        indicator.append("bollinger")
+    if any(term in query for term in ("거래량", "거래대금")):
+        indicator.append("volume")
+    if any(term in query for term in ("20일선", "20일 이동평균")):
+        indicator.append("sma_20")
+    if "200일" in query:
+        indicator.append("sma_200")
+    if any(term in query for term in ("per", "PER", "저PER")):
+        indicator.append("per")
+    if "roe" in lowered or "ROE" in query:
+        indicator.append("roe")
+
+    if "rsi" in lowered and any(value in query for value in ("30", "70")):
+        rsi_rules = rsi_trade_rules(query)
+        operator = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}[rsi_rules.entry_operator]
+        threshold.append(f"rsi {operator} {int(rsi_rules.entry_threshold)}")
+    if "40" in query and "rsi" in lowered:
+        threshold.append("rsi <= 40")
+    if "150" in query and "거래량" in query:
+        threshold.append("volume_ratio_20 >= 1.5")
+    if "100" in query and "부채" in query:
+        threshold.append("debt_ratio <= 100")
+
+    if "14" in query and "rsi" in lowered:
+        lookback.append("14d")
+    if "20일" in query:
+        lookback.append("20 trading days")
+    if "52주" in query:
+        lookback.append("52w")
+    if "최근" in query:
+        horizon.append("recent")
+    if "3개월" in query:
+        horizon.append("3m")
+    if "5거래일" in query:
+        horizon.append("5 trading days")
+
+    if any(term in query for term in ("종가", "close", "재진입", "반등", "돌파")):
+        price_basis.append("close")
+    if "하단" in query and ("재진입" in query or "반등" in query) and "bollinger" in indicator:
+        event.append("lower_band_reentry")
+        action.extend(["find_candidates", "reentry", "cross_above"])
+        if "close" not in price_basis:
+            price_basis.append("close")
+    elif any(term in query for term in ("신고가", "돌파")):
+        event.append("new_52w_high" if "52주" in query else "upper_band_breakout")
+        action.extend(["find_candidates", "breakout"])
+    elif "반등" in query:
+        event.append("rebound")
+        action.extend(["find_candidates", "rebound"])
+    else:
+        action.append("find_candidates")
+
+    sector = extract_sector_from_query(query, get_known_sectors())
+    if not indicator:
+        missing_slots.append("indicator")
+    if "bollinger" in indicator and "lower_band_reentry" in event and "close" not in price_basis:
+        missing_slots.append("price_basis")
+    if _has_conflicting_targets(query):
+        contradictions.append("low_volatility_vs_short_term_surge")
+
+    confidence = 0.9 if indicator and not contradictions else 0.62 if indicator else 0.45
+    parse_status = (
+        "ready"
+        if confidence >= 0.65 and not contradictions and not missing_slots
+        else "needs_clarification"
+    )
+    return SemanticSlots(
+        indicator=_unique(indicator),
+        threshold=_unique(threshold),
+        lookback=_unique(lookback),
+        horizon=_unique(horizon),
+        price_basis=_unique(price_basis),
+        event=_unique(event),
+        action=_unique(action),
+        sector=sector,
+        slot_evidence_refs=[f"semantic:{trace_id}:deterministic"],
+        missing_slots=missing_slots,
+        contradictions=contradictions,
+        confidence=confidence,
+        parse_status=parse_status,
+    )
+
+
+def plan_data_requirements(
+    semantic_slots: SemanticSlots, *, query: str | None = None
+) -> list[DataRequirement]:
+    """What this run will read, as the loader will actually read it.
+
+    The families used to be inferred purely from `semantic_slots`, whose indicator list
+    comes from a fixed Korean keyword table (rsi/볼린저/거래량/20일선/200일/per/roe). A
+    strategy phrased outside that table - "반도체 섹터 주도주 중 상대강도 강한 종목" - set
+    no indicator, so the plan came out empty and the run reported "조회할 데이터 항목
+    0종" while the loader went on to screen the whole universe on price/TA and backtest
+    233 names. The plan was describing a different run than the one that executed.
+
+    So the families are taken from the screening profile the loader will use, and the
+    slots only add what the profile cannot know about. `query` is optional so callers
+    that only have slots still work; passing it is what makes the count honest.
+    """
+
+    requirements: list[DataRequirement] = []
+    indicators = set(semantic_slots.indicator)
+    events = set(semantic_slots.event)
+    families = set(screening_data_families(query)) if query is not None else set()
+    if (
+        "ohlcv_ta" in families
+        or indicators & {"rsi", "bollinger", "volume", "sma_20", "sma_200"}
+        or events & {"lower_band_reentry", "new_52w_high", "upper_band_breakout"}
+    ):
+        requirements.append(
+            DataRequirement(
+                family="ohlcv_ta",
+                availability="available",
+                owner="ai_graph",
+                preferred_source="internal_db",
+                fallback_sources=["krx"],
+                freshness_requirement="same_trading_day",
+                source_confidence_floor=0.85,
+                evidence_ref="data-plan:ohlcv_ta",
+            )
+        )
+    if (
+        "fundamentals" in families
+        or indicators & {"per", "roe"}
+        or any(slot in semantic_slots.threshold for slot in ("debt_ratio <= 100",))
+    ):
+        requirements.append(
+            DataRequirement(
+                family="fundamentals",
+                availability="outside_owner",
+                owner="product_data_gap",
+                preferred_source="dart",
+                fallback_sources=["aoai_web_search"],
+                freshness_requirement="report_period",
+                source_confidence_floor=0.75,
+                proxy_allowed=True,
+                evidence_ref="data-plan:fundamentals",
+            )
+        )
+    if events & {"disclosure", "earnings_surprise"}:
+        requirements.append(
+            DataRequirement(
+                family="disclosure",
+                availability="partial",
+                owner="data_source_config",
+                preferred_source="dart",
+                fallback_sources=["aoai_web_search"],
+                freshness_requirement="latest_filing",
+                source_confidence_floor=0.8,
+                evidence_ref="data-plan:disclosure",
+            )
+        )
+    return requirements
+
+
+def build_source_usage(
+    query: str,
+    requirements: list[DataRequirement],
+    *,
+    trace_id: str,
+    pipeline_metadata: Mapping[str, Any],
+) -> list[SourceUsage]:
+    now = datetime.now(UTC)
+    usage: list[SourceUsage] = []
+    for requirement in requirements:
+        uses_postgres = (
+            pipeline_metadata.get("source") == "postgres"
+            and requirement.preferred_source == "internal_db"
+        )
+        source_ref = pipeline_metadata.get("price_source") if uses_postgres else None
+        usage.append(
+            SourceUsage(
+                source_type="internal_db" if uses_postgres else "none",
+                query=f"{requirement.family}: {query}",
+                retrieved_at=now,
+                source_refs=[str(source_ref)] if source_ref else [],
+                freshness_status=(
+                    freshness_status_from_metadata(pipeline_metadata)
+                    if uses_postgres
+                    else "unknown"
+                ),
+                confidence=requirement.source_confidence_floor if uses_postgres else 0.0,
+                fallback_used=pipeline_metadata.get("source") == "fixture",
+                evidence_refs=[f"source:{trace_id}:{requirement.family}"],
+            )
+        )
+    return usage
+
+
+def build_evidence_refs(source_usage: list[SourceUsage], *, trace_id: str) -> list[EvidenceRef]:
+    return [
+        EvidenceRef(
+            ref_id=usage.evidence_refs[0] if usage.evidence_refs else f"source:{trace_id}:{index}",
+            source_type=usage.source_type,
+            stage="data_retrieval",
+            retrieved_at=usage.retrieved_at,
+            sanitized_summary=f"{usage.source_type} source used for {usage.query.split(':', 1)[0]}",
+            confidence=usage.confidence,
+        )
+        for index, usage in enumerate(source_usage)
+    ]
+
+
+def data_source_inventory() -> list[dict[str, Any]]:
+    return [
+        {
+            "source_type": "internal_db",
+            "families": ["ohlcv_ta", "analyst_evidence"],
+            "live_required": False,
+        },
+        {"source_type": "krx", "families": ["ohlcv_ta"], "live_required": False},
+        {
+            "source_type": "dart",
+            "families": ["disclosure", "event", "fundamentals"],
+            "live_required": False,
+        },
+        {
+            "source_type": "aoai_web_search",
+            "families": ["event", "macro_fx_rates_commodities", "consensus_guidance"],
+            "live_required": False,
+        },
+        {
+            "source_type": "analyst_evidence",
+            "families": ["analyst_evidence", "consensus_guidance"],
+            "live_required": False,
+        },
+    ]
+
+
+def _aggregate_freshness_status(source_usage: list[SourceUsage]) -> str:
+    statuses = {usage.freshness_status for usage in source_usage}
+    if "stale" in statuses:
+        return "stale"
+    if "unknown" in statuses:
+        return "unknown"
+    return "fresh" if statuses else "unknown"
+
+
+def _proxy_disclosure(requirements: list[DataRequirement]) -> dict[str, str] | None:
+    proxied = [requirement for requirement in requirements if requirement.proxy_used]
+    if not proxied:
+        return None
+    return {
+        requirement.family: requirement.proxy_disclosure.get("reason", "proxy used")
+        if requirement.proxy_disclosure
+        else "proxy used"
+        for requirement in proxied
+    }
+
+
+def _unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def strategy_candidate_cards(
+    research_cards: list[StrategyCandidateCard] | None = None,
+    *,
+    screening_candidates: list[dict[str, Any]] | None = None,
+    sector: str | None = None,
+) -> list[StrategyCandidateCard]:
+    """Attach server screening matches to live analyst-research cards only.
+
+    Empty discovery results stay empty: no static textbook-card fallback is allowed.
+    """
+
+    cards = list(research_cards) if isinstance(research_cards, list) else []
+    if screening_candidates:
+        cards = _attach_screening_matches(cards, screening_candidates, sector=sector)
+    return cards
+
+
+def _attach_screening_matches(
+    cards: list[StrategyCandidateCard],
+    screening_candidates: list[dict[str, Any]],
+    *,
+    sector: str | None,
+) -> list[StrategyCandidateCard]:
+    if not cards:
+        return cards
+    filtered = [
+        c for c in screening_candidates if not sector or c.get("sector") == sector
+    ] or screening_candidates
+    matches = [
+        ScreeningMatch(
+            ticker=c["ticker"],
+            name=c["name"],
+            market=c["market"],
+            sector=c.get("sector"),
+            as_of_date=c["as_of_date"],
+            close=c.get("close"),
+            matched_rules=c.get("matched_rules", []),
+        )
+        for c in filtered
+    ]
+    primary = cards[0].model_copy(
+        update={
+            "sector": sector,
+            "matches": matches,
+            "title": f"{cards[0].title} · {sector}" if sector else cards[0].title,
+        }
+    )
+    return [primary, *cards[1:]]
+
+
+def build_clarification_prompt(category: AmbiguityCode, query: str) -> dict[str, Any]:
+    """Three things still stop a run: a message that is not asking for a strategy at
+    all, an unsupported asset class, and a condition the warehouse cannot evaluate.
+    Everything else the interpreter decides itself, so there is no longer a prompt for
+    a vague sentence or an unfamiliar term."""
+
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return {
+            "question": "어떤 투자 전략이나 매매 조건을 분석할까요?",
+            "question_reason": "전략 요청이 아닌 대화로 보여 분석을 시작하지 않았습니다.",
+            "options": [],
+            "recommended": None,
+            "confidence": 1.0,
+            "confidence_reason": "전략을 요청한 것이 확실할 때만 분석 파이프라인을 시작합니다.",
+        }
+    if category == AmbiguityCode.INFEASIBLE:
+        options = [
+            ClarificationOption(
+                label="KRX 현물로 대체", reason="현재 실행 가능한 데이터/백테스트 범위입니다."
+            ),
+            ClarificationOption(
+                label="기술 신호만 분석", reason="파생상품 노출 대신 현물 proxy 신호를 확인합니다."
+            ),
+            ClarificationOption(
+                label="지원 범위 확인", reason="지원하지 않는 자산군을 명확히 분리합니다."
+            ),
+        ]
+        return _clarification(
+            question="KRX 현물 주식 전략으로 바꿔서 볼까요?",
+            question_reason="옵션·선물·가상자산은 현재 데이터 인프라 범위 밖입니다.",
+            options=options,
+            recommended=0,
+            confidence=0.9,
+            confidence_reason="현재 API/백테스트는 KRX 현물 주식 중심으로 검증됩니다.",
+        )
+    return _clarification(
+        question="최신 애널리스트 리포트를 조사해 백테스트 후보를 도출하겠습니다.",
+        question_reason="정적 지표 후보는 제시하지 않으며, 조사 근거를 통과한 후보만 표시합니다.",
+        options=[],
+        recommended=None,
+        confidence=0.0,
+        confidence_reason="AI confidence는 리포트 근거·독립성·규칙 실행 가능성 검토 후에만 계산됩니다.",
+    )
+
+
+def _clarification(
+    *,
+    question: str,
+    question_reason: str,
+    options: list[ClarificationOption],
+    recommended: int | None,
+    confidence: float,
+    confidence_reason: str,
+) -> dict[str, Any]:
+    return {
+        "question": question,
+        "question_reason": question_reason,
+        "options": options[:3],
+        "recommended": recommended,
+        "confidence": confidence,
+        "confidence_reason": confidence_reason,
+    }
+
+
+def _clarification_from_ambiguity(ambiguity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "question": ambiguity.get("clarification_question"),
+        "options": [
+            ClarificationOption.model_validate(option) for option in ambiguity.get("options", [])
+        ],
+        "recommended": ambiguity.get("recommended_option"),
+    }
+
+
+def _ambiguity_dimensions(category: AmbiguityCode, query: str) -> list[str]:
+    if category == AmbiguityCode.READY:
+        return []
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return ["intent_missing"]
+    if category == AmbiguityCode.INPUT_AMBIGUOUS:
+        # The only route left to this category is a condition the warehouse cannot
+        # evaluate (data_node's _unverifiable_ambiguity), never a vague sentence.
+        return ["data_missing"]
+    if category == AmbiguityCode.TERM_UNKNOWN:
+        return ["intent_ambiguous", "source_resolvable"]
+    if category == AmbiguityCode.CONFLICTING:
+        return ["intent_ambiguous", "source_conflict"]
+    return ["unsupported_source"]
+
+
+def _clarification_blocker_type(category: AmbiguityCode) -> str | None:
+    if category == AmbiguityCode.READY:
+        return None
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return "intent_missing"
+    if category == AmbiguityCode.INPUT_AMBIGUOUS:
+        return "data_missing"
+    if category == AmbiguityCode.TERM_UNKNOWN:
+        return "intent_ambiguous"
+    if category == AmbiguityCode.CONFLICTING:
+        return "source_conflict"
+    return "unsupported_source"
+
+
+def _has_conflicting_targets(query: str) -> bool:
+    return any(term in query for term in ("변동성 낮", "저변동성")) and "급등" in query
+
+
+def _is_pullback_rsi_volume_query(query: str) -> bool:
+    lowered = query.lower()
+    has_trend_filter = "200일" in query or "sma200" in lowered or "sma_200" in lowered
+    has_rsi_pullback = "rsi" in lowered and ("40" in query or "눌" in query)
+    has_volume_filter = "거래량" in query or "volume" in lowered
+    return has_trend_filter and has_rsi_pullback and has_volume_filter
+
+
+def _ambiguity_reasons(category: AmbiguityCode, query: str) -> list[str]:
+    if category == AmbiguityCode.READY:
+        return ["L1/L2 또는 기술 지표 조건으로 해석 가능한 KRX 현물 전략입니다."]
+    if category == AmbiguityCode.NO_STRATEGY_INTENT:
+        return ["전략 관련 표현이 없어 분석 파이프라인을 시작하지 않습니다."]
+    if category == AmbiguityCode.INPUT_AMBIGUOUS:
+        return ["요청한 조건 중 현재 적재된 데이터로 검증할 수 없는 항목이 있습니다."]
+    return [f"{query[:40]} 입력은 현재 KRX 현물 데이터 범위를 벗어난 자산군을 포함합니다."]
+
+
+def build_strategy_spec(
+    query: str,
+    *,
+    variant: str,
+    semantic_slots: Mapping[str, Any] | None = None,
+    original_query: str | None = None,
+    backtest_years: int | None = None,
+) -> StrategySpec:
+    # The interpreter may turn "알아서 좋은 거" into a concrete RSI sentence.  That
+    # resolution is useful for data lookup but it must not erase the user's original
+    # lack of a rule; otherwise an arbitrary interpreter default becomes user intent.
+    preference_query = original_query or query
+    selection_mode = classify_strategy_request(preference_query)
+    automatic_preferences = (
+        infer_automatic_strategy_preferences(preference_query)
+        if selection_mode == "automatic"
+        else None
+    )
+    profile = _strategy_profile(
+        query,
+        semantic_slots=semantic_slots,
+        selection_mode=selection_mode,
+    )
+    slots = semantic_slots or {}
+    sector = slots.get("sector")
+    fallback_conditions = StrategyConditionsPayload(
+        entry_conditions=profile["entry_conditions"],
+        exit_conditions=profile["exit_conditions"],
+        indicators=profile["indicators"],
+        confidence=float(profile["confidence"]),
+    )
+    # Automatic mode is a deterministic, cited strategy.  Letting the language model
+    # rewrite its conditions would make the displayed rationale differ from the rule
+    # actually backtested.  Concrete user rules continue through the normal parser.
+    conditions = (
+        fallback_conditions
+        if selection_mode == "automatic"
+        else generate_strategy_conditions(
+            query=query,
+            semantic_slots=dict(slots),
+            fallback=fallback_conditions,
+        )
+    )
+    risk_constraints: dict[str, float | int | str | bool] = {
+        "max_position_pct": 0.1,
+        "stop_loss_pct": 0.08,
+    }
+    customization_assumptions: list[str] = []
+    strategy_name = str(profile["name"])
+    if automatic_preferences is not None:
+        medium_momentum_weight = {
+            "short": 0.70,
+            "medium": 0.60,
+            "long": 0.40,
+        }[automatic_preferences.horizon]
+        risk_constraints = {
+            "max_position_pct": round(1.0 / automatic_preferences.max_positions, 6),
+            "stop_loss_pct": automatic_preferences.stop_loss_pct,
+            "take_profit_pct": 10.0,
+            "trailing_stop_pct": automatic_preferences.trailing_stop_pct,
+            "rebalance_interval_days": automatic_preferences.rebalance_interval_days,
+            "medium_momentum_weight": medium_momentum_weight,
+            "strategy_style": automatic_preferences.risk_style,
+            "investment_horizon": automatic_preferences.horizon,
+            "benchmark_objective": "fixed_universe_excess_return",
+            "benchmark_evaluation_period_days": 126,
+            # The generic automatic StrategySpec intentionally has broad indicators.
+            # Preserve the normalized request so the pre-registered catalog can tell
+            # "low volatility" from "breakout" without inspecting any return data.
+            "catalog_query": preference_query,
+        }
+        style_label = {
+            "aggressive": "공격형",
+            "balanced": "균형형",
+            "defensive": "방어형",
+        }[automatic_preferences.risk_style]
+        horizon_label = {
+            "short": "단기",
+            "medium": "중기",
+            "long": "장기",
+        }[automatic_preferences.horizon]
+        strategy_name = f"{style_label}·{horizon_label} {strategy_name}"
+        customization_assumptions = [
+            f"사용자 입력을 {style_label}·{horizon_label} 성향으로 해석",
+            (
+                f"최대 {automatic_preferences.max_positions}종목, "
+                f"{automatic_preferences.rebalance_interval_days}거래일 교체, "
+                f"손절 {automatic_preferences.stop_loss_pct:.0%}, "
+                f"고점 추적손절 {automatic_preferences.trailing_stop_pct:.0%}"
+            ),
+            "63거래일 고정 구간 중 벤치마크 패배 구간이 50% 이상이면 검증 실패",
+        ]
+    return StrategySpec(
+        strategy_id=f"{profile['strategy_id']}_{variant.lower()}",
+        name=strategy_name,
+        market="KRX",
+        sector=sector,
+        timeframe="daily",
+        backtest_years=backtest_years,
+        entry_conditions=conditions.entry_conditions,
+        exit_conditions=conditions.exit_conditions,
+        indicators=conditions.indicators or profile["indicators"],
+        risk_constraints=risk_constraints,
+        assumptions=[
+            f"sector filter: {sector}" if sector else "all matching listed common stocks",
+            "daily adjusted close data",
+            *customization_assumptions,
+            *profile["assumptions"],
+        ],
+        source_refs=list(profile.get("source_refs", [])),
+        selection_mode=selection_mode,
+        confidence=float(conditions.confidence),
+    )
+
+
+def _strategy_profile(
+    query: str,
+    *,
+    semantic_slots: Mapping[str, Any] | None = None,
+    selection_mode: str | None = None,
+) -> dict[str, Any]:
+    profile = _strategy_profile_base(
+        query,
+        semantic_slots=semantic_slots,
+        selection_mode=selection_mode,
+    )
+    sector = semantic_slots.get("sector") if semantic_slots else None
+    if sector:
+        profile = {
+            **profile,
+            "name": f"{profile['name']} ({sector})",
+            "assumptions": [*profile["assumptions"], f"{sector} 섹터로 후보를 한정합니다."],
+        }
+    return profile
+
+
+def _strategy_profile_base(
+    query: str,
+    *,
+    semantic_slots: Mapping[str, Any] | None = None,
+    selection_mode: str | None = None,
+) -> dict[str, Any]:
+    lowered = query.lower()
+    slot_indicator = set(semantic_slots.get("indicator", [])) if semantic_slots else set()
+    slot_event = set(semantic_slots.get("event", [])) if semantic_slots else set()
+    rsi_rules = rsi_trade_rules(query)
+    rsi_operator_symbols = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
+    rsi_is_overbought = rsi_rules.entry_side == "overbought"
+    rsi_entry_description = (
+        f"RSI {rsi_operator_symbols[rsi_rules.entry_operator]} {int(rsi_rules.entry_threshold)}"
+    )
+    if not rsi_is_overbought and rsi_rules.entry_operator == "lte":
+        rsi_entry_description += " 또는 30 상향 회복"
+    rsi_exit_description = (
+        f"RSI {rsi_operator_symbols[rsi_rules.exit_operator]} {int(rsi_rules.exit_threshold)}"
+    )
+    if (selection_mode or classify_strategy_request(query)) == "automatic":
+        return {
+            "strategy_id": "automatic_performance_momentum",
+            "name": "벤치마크 초과수익 맞춤 모멘텀 전략군",
+            "entry_conditions": [
+                Condition(
+                    left="past_only_signal",
+                    operator="eq",
+                    right=1,
+                    description="미래 데이터를 쓰지 않은 모멘텀·추세 신호가 매수 상태",
+                ),
+                Condition(
+                    left="trend_confirmation",
+                    operator="eq",
+                    right=1,
+                    description="후보 전략의 중기 또는 장기 상승 추세 확인",
+                ),
+                Condition(
+                    left="risk_filter",
+                    operator="eq",
+                    right=1,
+                    description="변동성·손실 제한 조건 통과",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="selected_profile_exit",
+                    operator="eq",
+                    right=1,
+                    description="선택된 전략의 추세 훼손 또는 손실 제한 규칙",
+                )
+            ],
+            "indicators": [
+                "cross_sectional_rank",
+                "momentum_12_1",
+                "medium_momentum_126d",
+                "SMA200",
+                "realized_volatility_21d",
+                "rebalance_21d",
+                "crash_risk_guard",
+                "benchmark_period_gate",
+            ],
+            "assumptions": [
+                "사용자 위험성향과 투자기간에 맞는 독립 모멘텀 전략 3개를 백테스트 전에 생성",
+                "앞 70% 구간만 후보 선택에 사용하고 마지막 30%는 별도 검증",
+                "63거래일 고정 구간 중 벤치마크에 진 구간이 50% 이상이면 패배",
+                "지표는 평가 시점까지 알려진 조정 종가만 사용",
+                "45% 같은 조기 고정 익절로 큰 승자를 자르지 않고 상대 순위와 장기 추세가 유지되면 보유",
+                "보유 종목 수·교체 주기·손실 제한은 사용자 입력에서 수익률을 보기 전에 결정",
+                "후보 수와 기본 파라미터를 백테스트 전에 고정해 과최적화 탐색을 제한",
+                "과거 연구와 백테스트는 미래 수익을 보장하지 않음",
+            ],
+            "source_refs": robust_strategy_source_refs(),
+            "confidence": 0.84,
+        }
+    if _is_pullback_rsi_volume_query(query):
+        return {
+            "strategy_id": "pullback_rsi_volume",
+            "name": "RSI40 거래량 눌림목",
+            "entry_conditions": [
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="주가가 200일선 위",
+                ),
+                Condition(left="rsi", operator="lte", right=40, description="RSI(14) <= 40 눌림"),
+                Condition(
+                    left="volume_ratio_20",
+                    operator="gte",
+                    right=1.0,
+                    description="거래량이 20일 평균 이상",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(left="rsi", operator="gte", right=60, description="RSI >= 60 회복"),
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"
+                ),
+            ],
+            "indicators": ["SMA200", "RSI", "volume_ratio_20"],
+            "assumptions": [
+                "200일선 위는 상승추세 필터로 해석",
+                "RSI 40 이하는 과매도보다 완만한 눌림목 조건으로 해석",
+                "거래량 20일 평균 이상은 volume_ratio_20 >= 1.0으로 해석",
+            ],
+            "confidence": 0.82,
+        }
+    if "dividend_defensive" in lowered or "배당 방어주" in query:
+        return {
+            "strategy_id": "dividend_defensive",
+            "name": "배당 방어주",
+            "entry_conditions": [
+                Condition(
+                    left="dividend_yield",
+                    operator="gte",
+                    right=0.04,
+                    description="배당수익률 4% 이상",
+                ),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="dividend_cut_5y",
+                    operator="eq",
+                    right=0,
+                    description="최근 5년 배당 삭감 없음",
+                ),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 기술 확인",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"
+                )
+            ],
+            "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
+            "assumptions": [
+                "배당수익률과 부채비율은 L1/L2에서 재무 안정성 필터로 해석",
+                "배당 삭감 이력 데이터가 없으면 원 조건을 보류하며 기술 조건으로 대체 백테스트하지 않음",
+            ],
+            "confidence": 0.73,
+        }
+    if "value_quality" in lowered or "저평가 퀄리티" in query:
+        return {
+            "strategy_id": "value_quality",
+            "name": "저평가 퀄리티",
+            "entry_conditions": [
+                Condition(
+                    left="per_percentile",
+                    operator="lte",
+                    right=0.4,
+                    description="PER 업종/시장 하위권",
+                ),
+                Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="단기 상대강도 약화",
+                )
+            ],
+            "indicators": ["PER", "ROE", "debt_ratio", "relative_strength_20d"],
+            "assumptions": ["재무 조건은 후보 필터, OHLCV 기반 상대강도는 검증 proxy로 사용"],
+            "confidence": 0.75,
+        }
+    if "reasonable_growth" in lowered or "합리적 성장주" in query:
+        return {
+            "strategy_id": "reasonable_growth",
+            "name": "합리적 성장주",
+            "entry_conditions": [
+                Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
+                Condition(
+                    left="sales_growth",
+                    operator="gte",
+                    right=0.1,
+                    description="매출 성장률 10% 이상",
+                ),
+                Condition(
+                    left="per_vs_industry",
+                    operator="lte",
+                    right=1,
+                    description="PER 업종 평균 이하",
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
+            ],
+            "indicators": ["ROE", "sales_growth", "PER", "SMA50"],
+            "assumptions": ["성장성과 밸류에이션을 결합한 GARP 후보로 확정"],
+            "confidence": 0.72,
+        }
+    if any(term in query for term in ("순현금", "자사주", "PBR 1배")):
+        return {
+            "strategy_id": "asset_value_catalyst",
+            "name": "자산가치 촉매",
+            "entry_conditions": [
+                Condition(left="pbr", operator="lte", right=1, description="PBR 1배 이하"),
+                Condition(left="net_cash", operator="gte", right=1, description="순현금 보유"),
+                Condition(
+                    left="buyback_notice", operator="eq", right=1, description="자사주 매입 공시"
+                ),
+                Condition(
+                    left="close_above_sma_20",
+                    operator="eq",
+                    right=1,
+                    description="20일선 위 기술 확인",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["PBR", "net_cash", "buyback_notice", "SMA20"],
+            "assumptions": [
+                "공시/재무 조건은 후보 필터, OHLCV 기반 추세 회복은 백테스트 proxy로 사용"
+            ],
+            "confidence": 0.69,
+        }
+    if any(
+        term in lowered or term in query for term in ("저per", "per", "pbr", "저평가", "가치주")
+    ):
+        return {
+            "strategy_id": "value_quality",
+            "name": "저평가 퀄리티",
+            "entry_conditions": [
+                Condition(
+                    left="per_percentile",
+                    operator="lte",
+                    right=0.4,
+                    description="PER 업종/시장 하위권",
+                ),
+                Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="단기 상대강도 약화",
+                )
+            ],
+            "indicators": ["PER", "ROE", "debt_ratio", "relative_strength_20d"],
+            "assumptions": ["재무 조건은 후보 필터, OHLCV 기반 상대강도는 검증 proxy로 사용"],
+            "confidence": 0.75,
+        }
+    if any(term in query for term in ("저변동성", "방어주")) and "배당" in query:
+        return {
+            "strategy_id": "low_vol_defensive",
+            "name": "저변동 배당 방어주",
+            "entry_conditions": [
+                Condition(
+                    left="realized_volatility_20d",
+                    operator="lte",
+                    right=0.25,
+                    description="20일 변동성 낮음",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 시장 대비 우위",
+                ),
+                Condition(
+                    left="dividend_yield", operator="gte", right=0.04, description="배당수익률 양호"
+                ),
+                Condition(
+                    left="close_above_sma_20", operator="eq", right=1, description="20일선 위"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="상대강도 약화",
+                )
+            ],
+            "indicators": [
+                "realized_volatility_20d",
+                "relative_strength_20d",
+                "dividend_yield",
+                "SMA20",
+            ],
+            "assumptions": ["방어주 성격은 저변동성과 배당 조건, 진입 타이밍은 OHLCV proxy로 검증"],
+            "confidence": 0.7,
+        }
+    if any(term in query for term in ("금리", "리츠", "유틸리티")):
+        return {
+            "strategy_id": "rate_sensitive_income",
+            "name": "금리 민감 인컴주",
+            "entry_conditions": [
+                Condition(
+                    left="rate_down_proxy",
+                    operator="eq",
+                    right=1,
+                    description="금리 하락기 강세 업종 후보",
+                ),
+                Condition(
+                    left="dividend_yield",
+                    operator="gte",
+                    right=0.04,
+                    description="배당 또는 인컴 성격",
+                ),
+                Condition(
+                    left="close_above_sma_50",
+                    operator="eq",
+                    right=1,
+                    description="50일선 위 기술 상승",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
+            ],
+            "indicators": ["rate_down_proxy", "dividend_yield", "SMA50"],
+            "assumptions": ["금리 민감도와 업종 분류는 후보 필터, 현재 검증은 추세 proxy로 수행"],
+            "confidence": 0.66,
+        }
+    if "배당" in query:
+        return {
+            "strategy_id": "dividend_defensive",
+            "name": "배당 방어주",
+            "entry_conditions": [
+                Condition(
+                    left="dividend_yield",
+                    operator="gte",
+                    right=0.04,
+                    description="배당수익률 4% 이상",
+                ),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="dividend_cut_5y",
+                    operator="eq",
+                    right=0,
+                    description="최근 5년 배당 삭감 없음",
+                ),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 기술 확인",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 이탈"
+                )
+            ],
+            "indicators": ["dividend_yield", "debt_ratio", "dividend_cut_5y", "SMA200"],
+            "assumptions": [
+                "배당수익률과 부채비율은 L1/L2에서 재무 안정성 필터로 해석",
+                "배당 삭감 이력 데이터가 없으면 원 조건을 보류하며 기술 조건으로 대체 백테스트하지 않음",
+            ],
+            "confidence": 0.73,
+        }
+    if any(term in query for term in ("원달러", "환율", "수출주")):
+        return {
+            "strategy_id": "fx_exporter_revision",
+            "name": "환율 수혜 이익상향",
+            "entry_conditions": [
+                Condition(
+                    left="fx_benefit_proxy",
+                    operator="eq",
+                    right=1,
+                    description="환율 상승 수혜 업종 후보",
+                ),
+                Condition(
+                    left="earnings_revision_3m",
+                    operator="gte",
+                    right=0,
+                    description="이익 전망 상향",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="상대강도 약화",
+                )
+            ],
+            "indicators": ["fx_benefit_proxy", "earnings_revision_3m", "relative_strength_20d"],
+            "assumptions": [
+                "환율 수혜와 이익 전망은 후보 필터, OHLCV 상대강도는 검증 proxy로 사용"
+            ],
+            "confidence": 0.65,
+        }
+    if any(term in query for term in ("원자재", "마진 개선", "화학", "운송", "소비재")):
+        return {
+            "strategy_id": "margin_improvement",
+            "name": "원가하락 마진 개선",
+            "entry_conditions": [
+                Condition(
+                    left="input_cost_tailwind_proxy",
+                    operator="eq",
+                    right=1,
+                    description="원자재 가격 하락 수혜 후보",
+                ),
+                Condition(
+                    left="operating_margin_improving",
+                    operator="eq",
+                    right=1,
+                    description="영업이익률 개선",
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
+            ],
+            "indicators": ["input_cost_tailwind_proxy", "operating_margin", "SMA50"],
+            "assumptions": ["원자재/업종 민감도는 후보 필터, 기술 추세는 검증 proxy로 사용"],
+            "confidence": 0.64,
+        }
+    if any(term in query for term in ("매출총이익률", "재고자산", "재고")):
+        return {
+            "strategy_id": "margin_inventory_quality",
+            "name": "마진·재고 퀄리티",
+            "entry_conditions": [
+                Condition(
+                    left="gross_margin_streak",
+                    operator="gte",
+                    right=3,
+                    description="매출총이익률 3개 분기 개선",
+                ),
+                Condition(
+                    left="inventory_growth_vs_sales",
+                    operator="lte",
+                    right=1,
+                    description="재고 증가율이 매출 증가율 이하",
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
+            ],
+            "indicators": ["gross_margin", "inventory_growth", "sales_growth", "SMA50"],
+            "assumptions": ["분기 재무 품질 조건은 후보 필터, 가격 추세로 타이밍을 검증"],
+            "confidence": 0.68,
+        }
+    if any(term in lowered or term in query for term in ("fcf", "현금흐름", "현금흐름이 안정")):
+        return {
+            "strategy_id": "fcf_recovery",
+            "name": "FCF 회복주",
+            "entry_conditions": [
+                Condition(
+                    left="fcf_yield", operator="gte", right=0.05, description="FCF 수익률 양호"
+                ),
+                Condition(
+                    left="cashflow_stability", operator="eq", right=1, description="현금흐름 안정"
+                ),
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 회복",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_200", operator="eq", right=1, description="200일선 재이탈"
+                )
+            ],
+            "indicators": ["FCF_yield", "cashflow_stability", "SMA200"],
+            "assumptions": ["현금흐름 조건은 후보 필터, 200일선 회복은 기술 proxy로 검증"],
+            "confidence": 0.69,
+        }
+    if "4분기" in query or ("영업이익" in query and "60일 고점" in query):
+        return {
+            "strategy_id": "operating_profit_pullback",
+            "name": "이익성장 조정주",
+            "entry_conditions": [
+                Condition(
+                    left="operating_profit_growth_streak",
+                    operator="gte",
+                    right=4,
+                    description="4분기 연속 영업이익 증가",
+                ),
+                Condition(
+                    left="drawdown_60d",
+                    operator="lte",
+                    right=-0.1,
+                    description="60일 고점 대비 10% 이상 조정",
+                ),
+                Condition(
+                    left="relative_strength_60d",
+                    operator="gte",
+                    right=0,
+                    description="중기 상대강도 유지",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_60d",
+                    operator="lt",
+                    right=0,
+                    description="중기 상대강도 훼손",
+                )
+            ],
+            "indicators": ["operating_profit_growth", "drawdown_60d", "relative_strength_60d"],
+            "assumptions": ["분기 이익 조건은 후보 필터, 조정 폭과 상대강도는 OHLCV proxy로 검증"],
+            "confidence": 0.68,
+        }
+    if any(term in query for term in ("어닝", "가이던스", "EPS", "컨센서스", "실적 발표")):
+        if any(term in query for term in ("60거래일", "20% 이상 하락", "과매도 우량주")):
+            return {
+                "strategy_id": "oversold_quality",
+                "name": "과매도 우량주",
+                "entry_conditions": [
+                    Condition(
+                        left="drawdown_60d",
+                        operator="lte",
+                        right=-0.2,
+                        description="60일 고점 대비 20% 이상 하락",
+                    ),
+                    Condition(
+                        left="earnings_revision_3m",
+                        operator="gte",
+                        right=0,
+                        description="실적 컨센서스 유지",
+                    ),
+                    Condition(left="rsi", operator="lte", right=35, description="과매도권"),
+                ],
+                "exit_conditions": [
+                    Condition(left="rsi", operator="gte", right=60, description="반등 과열 전 청산")
+                ],
+                "indicators": ["drawdown_60d", "earnings_revision_3m", "RSI"],
+                "assumptions": ["컨센서스 유지 조건은 후보 필터, 낙폭과 RSI는 OHLCV proxy로 검증"],
+                "confidence": 0.69,
+            }
+        if "어닝" in query or "가이던스" in query or "실적 발표" in query:
+            strategy_id = "earnings_surprise_guidance"
+            name = "어닝 서프라이즈 가이던스"
+        else:
+            strategy_id = "earnings_momentum"
+            name = "실적 모멘텀"
+        return {
+            "strategy_id": strategy_id,
+            "name": name,
+            "entry_conditions": [
+                Condition(
+                    left="earnings_revision_3m",
+                    operator="gte",
+                    right=0,
+                    description="최근 3개월 이익 전망 상향",
+                ),
+                Condition(
+                    left="breakout_high",
+                    operator="eq",
+                    right=1,
+                    description="20일 신고가 또는 상단 돌파",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="상대강도 약화",
+                )
+            ],
+            "indicators": ["earnings_revision_3m", "rolling_high", "relative_strength_20d"],
+            "assumptions": [
+                "실적/가이던스 조건은 후보 필터, 신고가와 상대강도는 검증 proxy로 사용"
+            ],
+            "confidence": 0.72,
+        }
+    if any(term in query for term in ("기관", "외국인")):
+        return {
+            "strategy_id": "flow_accumulation",
+            "name": "기관·외국인 수급 모멘텀",
+            "entry_conditions": [
+                Condition(
+                    left="net_buy_streak_5d",
+                    operator="gte",
+                    right=5,
+                    description="기관·외국인 5거래일 순매수",
+                ),
+                Condition(
+                    left="close_above_sma_20", operator="eq", right=1, description="주가 20일선 위"
+                ),
+                Condition(
+                    left="volume_ratio_20", operator="gte", right=1, description="거래량 확인"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["net_buy_streak_5d", "SMA20", "volume_ratio_20"],
+            "assumptions": ["수급 데이터가 없으면 거래량과 20일선 proxy로 검증"],
+            "confidence": 0.66,
+        }
+    if "공매도" in query or "숏커버링" in query:
+        return {
+            "strategy_id": "short_covering_proxy",
+            "name": "숏커버링 proxy",
+            "entry_conditions": [
+                Condition(
+                    left="short_balance_high",
+                    operator="eq",
+                    right=1,
+                    description="공매도 잔고 높은 후보",
+                ),
+                Condition(
+                    left="volume_ratio_20", operator="gte", right=1.5, description="거래량 증가"
+                ),
+                Condition(left="bullish_breakout", operator="eq", right=1, description="양봉 돌파"),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["short_balance", "volume_ratio_20", "bullish_breakout"],
+            "assumptions": ["공매도 잔고는 후보 필터, 거래량·양봉 돌파는 백테스트 proxy로 사용"],
+            "confidence": 0.62,
+        }
+    if "갭" in query or "수급" in query:
+        return {
+            "strategy_id": "gap_hold_momentum",
+            "name": "갭 유지 수급 모멘텀",
+            "entry_conditions": [
+                Condition(left="gap_up", operator="eq", right=1, description="최근 갭 상승"),
+                Condition(
+                    left="gap_unfilled", operator="eq", right=1, description="갭 미충족 횡보"
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(left="gap_filled", operator="eq", right=1, description="갭 메움")
+            ],
+            "indicators": ["gap_up", "gap_unfilled", "relative_strength_20d"],
+            "assumptions": ["갭 유지 여부는 OHLCV 패턴으로 검증"],
+            "confidence": 0.67,
+        }
+    if (
+        "bollinger" in slot_indicator
+        or "lower_band_reentry" in slot_event
+        or "볼린저" in query
+        or "변동성" in query
+    ):
+        lower_reentry = "lower_band_reentry" in slot_event or any(
+            term in query for term in ("하단", "재진입", "반등")
+        )
+        return {
+            "strategy_id": "bollinger_lower_reentry"
+            if lower_reentry
+            else "bollinger_squeeze_breakout",
+            "name": "볼린저 하단 재진입" if lower_reentry else "볼린저 스퀴즈 돌파",
+            "entry_conditions": [
+                Condition(
+                    left="close_below_lower_band_recent",
+                    operator="eq",
+                    right=1,
+                    description="최근 종가가 볼린저 하단 밴드 아래를 확인",
+                ),
+                Condition(
+                    left="close_cross_above_lower_band",
+                    operator="eq",
+                    right=1,
+                    description="종가가 하단 밴드 위로 재진입",
+                ),
+            ]
+            if lower_reentry
+            else [
+                Condition(
+                    left="bb_width_percentile",
+                    operator="lte",
+                    right=0.25,
+                    description="밴드 폭 축소",
+                ),
+                Condition(
+                    left="bollinger_breakout",
+                    operator="eq",
+                    right=1,
+                    description="상단 돌파 또는 밴드 재진입",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_middle_band",
+                    operator="eq",
+                    right=1,
+                    description="중심선 이탈",
+                )
+            ],
+            "indicators": ["Bollinger Bands", "close"],
+            "assumptions": [
+                "볼린저 하단 재진입은 RSI 반등과 별도 의미로 보존",
+                "판정 기준은 종가 기준으로 고정",
+            ]
+            if lower_reentry
+            else ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
+            "confidence": 0.8 if lower_reentry else 0.74,
+        }
+    if "200일" in query and "rsi" in lowered:
+        return {
+            "strategy_id": "trend_rsi_volume_pullback",
+            "name": "추세 내 RSI 눌림목",
+            "entry_conditions": [
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="200일선 위 상승추세",
+                ),
+                Condition(left="rsi", operator="lte", right=40, description="RSI 40 이하 눌림"),
+                Condition(
+                    left="volume_ratio_20",
+                    operator="gte",
+                    right=1,
+                    description="거래량 20일 평균 이상",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["SMA200", "RSI", "volume_ratio_20"],
+            "assumptions": ["장기 추세는 200일선, 단기 눌림은 RSI와 거래량으로 검증"],
+            "confidence": 0.76,
+        }
+    if "1개월" in query and "6개월" in query:
+        return {
+            "strategy_id": "midterm_pullback",
+            "name": "중기 상승추세 눌림목",
+            "entry_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="최근 1개월 시장 대비 약세",
+                ),
+                Condition(
+                    left="relative_strength_120d",
+                    operator="gte",
+                    right=0,
+                    description="6개월 시장 대비 강세",
+                ),
+                Condition(
+                    left="close_above_sma_200", operator="eq", right=1, description="장기 추세 유지"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_120d",
+                    operator="lt",
+                    right=0,
+                    description="중기 상대강도 훼손",
+                )
+            ],
+            "indicators": ["relative_strength_20d", "relative_strength_120d", "SMA200"],
+            "assumptions": ["중기 추세와 단기 조정의 조합을 OHLCV proxy로 검증"],
+            "confidence": 0.72,
+        }
+    if "120일" in query and "20일선" in query:
+        return {
+            "strategy_id": "breakout_pullback",
+            "name": "신고가 돌파 후 되돌림",
+            "entry_conditions": [
+                Condition(
+                    left="breakout_high",
+                    operator="eq",
+                    right=1,
+                    description="120일 신고가 돌파 이력",
+                ),
+                Condition(
+                    left="close_to_sma20",
+                    operator="between",
+                    right=[0.98, 1.02],
+                    description="종가가 20일선의 ±2% 범위로 되돌림",
+                ),
+                Condition(
+                    left="relative_strength_60d",
+                    operator="gte",
+                    right=0,
+                    description="중기 상대강도 유지",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["rolling_high", "SMA20", "relative_strength_60d"],
+            "assumptions": ["신고가 이후 눌림목을 추세 지속 proxy로 검증"],
+            "confidence": 0.74,
+        }
+    if "돌파 대기" in query or "횡보" in query:
+        return {
+            "strategy_id": "breakout_setup",
+            "name": "돌파 대기",
+            "entry_conditions": [
+                Condition(
+                    left="close",
+                    operator="gte",
+                    right="high",
+                    window=60,
+                    aggregate="max",
+                    scale=0.98,
+                    description="직전 60거래일 고점의 98% 이상",
+                ),
+                Condition(
+                    left="volume",
+                    operator="lte",
+                    right="volume",
+                    window=20,
+                    aggregate="avg",
+                    scale=0.8,
+                    description="직전 20거래일 평균 거래량의 80% 이하",
+                ),
+                Condition(
+                    left="traded_value",
+                    operator="gte",
+                    right=0.0,
+                    universe_rank_pct=0.5,
+                    description="당일 유니버스 거래대금 상위 50%",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["rolling_high_60", "volume_avg_20", "traded_value"],
+            "assumptions": [
+                "고점 근접은 직전 60거래일 최고가의 98% 이상으로, 거래량 감소는 직전 20거래일 평균의 80% 이하로 정의",
+                "거래대금은 KRX 원천 ACC_TRDVAL을 사용하고, 당일 유니버스 상위 50% 조건을 적용",
+            ],
+            "confidence": 0.68,
+        }
+    if any(
+        term in query for term in ("영업이익률", "영업이익", "매출 성장률", "퀄리티 성장", "성장주")
+    ):
+        if "ROE 15%" in query or "합리적 성장주" in query or "PER" in query:
+            return {
+                "strategy_id": "reasonable_growth",
+                "name": "합리적 성장주",
+                "entry_conditions": [
+                    Condition(left="roe", operator="gte", right=0.15, description="ROE 15% 이상"),
+                    Condition(
+                        left="sales_growth",
+                        operator="gte",
+                        right=0.1,
+                        description="매출 성장률 10% 이상",
+                    ),
+                    Condition(
+                        left="per_vs_industry",
+                        operator="lte",
+                        right=1,
+                        description="PER 업종 평균 이하",
+                    ),
+                    Condition(
+                        left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                    ),
+                ],
+                "exit_conditions": [
+                    Condition(
+                        left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                    )
+                ],
+                "indicators": ["ROE", "sales_growth", "PER", "SMA50"],
+                "assumptions": ["성장성과 밸류에이션을 결합한 GARP 후보로 확정"],
+                "confidence": 0.72,
+            }
+        strategy_id = (
+            "quality_growth" if "ROE" in query or "업종 평균" in query else "growth_momentum"
+        )
+        return {
+            "strategy_id": strategy_id,
+            "name": "퀄리티 성장주" if strategy_id == "quality_growth" else "성장 모멘텀",
+            "entry_conditions": [
+                Condition(
+                    left="sales_growth",
+                    operator="gte",
+                    right=0.2 if "20%" in query else 0.1,
+                    description="매출 성장률 양호",
+                ),
+                Condition(
+                    left="operating_margin_improving",
+                    operator="eq",
+                    right=1,
+                    description="영업이익률 개선",
+                ),
+                Condition(
+                    left="debt_ratio", operator="lte", right=100, description="부채비율 100% 이하"
+                ),
+                Condition(
+                    left="close_above_sma_50", operator="eq", right=1, description="50일선 위"
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_50", operator="eq", right=1, description="50일선 이탈"
+                )
+            ],
+            "indicators": ["sales_growth", "operating_margin", "debt_ratio", "SMA50"],
+            "assumptions": ["성장·수익성 조건은 후보 필터, 추세는 OHLCV proxy로 검증"],
+            "confidence": 0.7,
+        }
+    if "rsi" in lowered or "rsi" in slot_indicator or "과매도" in query or "반등" in query:
+        return {
+            "strategy_id": "rsi_rebound",
+            "name": "RSI 과매수 모멘텀" if rsi_is_overbought else "RSI 과매도 반등",
+            "entry_conditions": [
+                Condition(
+                    left="rsi",
+                    operator=rsi_rules.entry_operator,
+                    right=rsi_rules.entry_threshold,
+                    description=rsi_entry_description,
+                )
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="rsi",
+                    operator=rsi_rules.exit_operator,
+                    right=rsi_rules.exit_threshold,
+                    description=rsi_exit_description,
+                )
+            ],
+            "indicators": ["RSI"],
+            "assumptions": [
+                "RSI 70 이상 매수·30 미만 매도 조건을 그대로 적용"
+                if rsi_is_overbought
+                else "RSI 30 회복 조건은 L2에서 과매도 반등 proxy로 해석"
+            ],
+            "confidence": 0.84,
+        }
+    if any(term in query for term in ("52주", "120일", "신고가", "거래량", "돌파", "갭")):
+        return {
+            "strategy_id": "breakout_volume_momentum",
+            "name": "거래량 돌파 모멘텀",
+            "entry_conditions": [
+                Condition(
+                    left="breakout_high",
+                    operator="eq",
+                    right=1,
+                    description="신고가 또는 상단 돌파",
+                ),
+                Condition(
+                    left="volume_ratio_20",
+                    operator="gte",
+                    right=1.5,
+                    description="20일 평균 대비 거래량 150% 이상",
+                ),
+                Condition(
+                    left="close_above_sma_20",
+                    operator="eq",
+                    right=1,
+                    description="종가가 20일선 위",
+                ),
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 상대강도 양호",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["rolling_high", "volume_ratio_20", "SMA20", "relative_strength_20d"],
+            "assumptions": ["신고가 기간은 입력의 52주/120일/20일 표현에 맞춰 L2에서 선택"],
+            "confidence": 0.8,
+        }
+    if any(term in query for term in ("눌림목", "200일", "20일선", "20일 이동평균")):
+        return {
+            "strategy_id": "pullback_trend",
+            "name": "상승추세 눌림목",
+            "entry_conditions": [
+                Condition(
+                    left="close_above_sma_200",
+                    operator="eq",
+                    right=1,
+                    description="주가가 200일선 위",
+                ),
+                Condition(
+                    left="close_to_sma20",
+                    operator="between",
+                    right=[0.98, 1.02],
+                    description="종가가 20일선의 ±2% 범위에서 조정",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_sma_20", operator="eq", right=1, description="20일선 이탈"
+                )
+            ],
+            "indicators": ["SMA20", "SMA200"],
+            "assumptions": [
+                "눌림목은 장기 상승추세 안에서 종가가 20일선의 ±2% 범위로 되돌린 상태로 정의"
+            ],
+            "confidence": 0.78,
+        }
+    if "볼린저" in query or "변동성" in query:
+        return {
+            "strategy_id": "bollinger_squeeze_breakout",
+            "name": "볼린저 스퀴즈 돌파",
+            "entry_conditions": [
+                Condition(
+                    left="bb_width_percentile",
+                    operator="lte",
+                    right=0.25,
+                    description="밴드 폭 축소",
+                ),
+                Condition(
+                    left="bollinger_breakout",
+                    operator="eq",
+                    right=1,
+                    description="상단 돌파 또는 밴드 재진입",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="close_below_middle_band",
+                    operator="eq",
+                    right=1,
+                    description="중심선 이탈",
+                )
+            ],
+            "indicators": ["Bollinger Bands", "realized_volatility"],
+            "assumptions": ["상단 돌파와 하단 재진입은 입력 문맥에 따라 L2에서 분기"],
+            "confidence": 0.74,
+        }
+    if any(term in query for term in ("상대강도", "주도주", "시장보다", "섹터")):
+        return {
+            "strategy_id": "relative_strength_leader",
+            "name": "상대강도 주도주",
+            "entry_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="gte",
+                    right=0,
+                    description="20일 시장 대비 초과수익",
+                ),
+                Condition(
+                    left="relative_strength_60d",
+                    operator="gte",
+                    right=0,
+                    description="60일 시장 대비 초과수익",
+                ),
+            ],
+            "exit_conditions": [
+                Condition(
+                    left="relative_strength_20d",
+                    operator="lt",
+                    right=0,
+                    description="단기 상대강도 약화",
+                )
+            ],
+            "indicators": ["relative_strength_20d", "relative_strength_60d"],
+            "assumptions": ["시장 대표 수익률을 비교 기준으로 해석"],
+            "confidence": 0.76,
+        }
+    return {
+        "strategy_id": "rsi_rebound",
+        "name": "RSI 과매수 모멘텀" if rsi_is_overbought else "RSI 과매도 반등",
+        "entry_conditions": [
+            Condition(
+                left="rsi",
+                operator=rsi_rules.entry_operator,
+                right=rsi_rules.entry_threshold,
+                description=rsi_entry_description,
+            )
+        ],
+        "exit_conditions": [
+            Condition(
+                left="rsi",
+                operator=rsi_rules.exit_operator,
+                right=rsi_rules.exit_threshold,
+                description=rsi_exit_description,
+            )
+        ],
+        "indicators": ["RSI"],
+        "assumptions": [
+            "RSI 70 이상 매수·30 미만 매도 조건을 그대로 적용"
+            if rsi_is_overbought
+            else "명확한 기술 조건이 없으면 RSI 평균회귀 후보를 기본 제안"
+        ],
+        "confidence": 0.68,
+    }
+
+
+def build_internal_payload(state: QuantAgentState) -> InternalPayload:
+    node_outputs = {
+        key: state[key]
+        for key in (
+            "ambiguity",
+            "semantic_slots",
+            "data_requirements",
+            "source_usage",
+            "failure_cause",
+            "evidence_refs",
+            "data",
+            "strategy_spec",
+            "original_strategy_spec",
+            "research_compile",
+            "research_sources",
+            "research_review",
+            "backtest_code",
+            "backtest",
+            "signal",
+            "investment_signal",
+            "risk",
+            "report_debate",
+            "report",
+        )
+        if key in state
+    }
+    validation = {
+        "node_sequence": list(NODE_SEQUENCE),
+        "schema_validation": "pydantic",
+        "langgraph_optional": True,
+        "pipeline_data_source": state.get("data", {}).get("pipeline_data_source", {}),
+        "data_availability": state.get("data", {}).get("data_availability", {}),
+        "semantic_parse_status": state.get("semantic_slots", {}).get("parse_status"),
+        "data_requirement_count": len(state.get("data_requirements", [])),
+        "source_usage_count": len(state.get("source_usage", [])),
+    }
+    return InternalPayload(
+        trace_id=state["trace_id"],
+        node_outputs=node_outputs,
+        llm_prompts=["research.md", "signal.md", "backtest_code.md", "report.md"],
+        validation=validation,
+        backtest_artifacts=state.get("backtest", {}),
+        risk_events=state.get("risk", {}).get("adjustments", []),
+    )
+
+
+def _ticker_actions(
+    state: QuantAgentState,
+    cards: list[StrategyCandidateCard],
+    *,
+    performance: PerformanceAvailable | PerformanceUnavailable | None = None,
+    recommendation_gate: RecommendationGate | None = None,
+) -> list[TickerAction]:
+    """Per-stock BUY/SELL/HOLD, plus WATCH for screened names the rule is not acting on.
+
+    The backtest reports only the names it acts on, because "no signal, no position" is
+    not a recommendation it can make about a stock it never looked at. The screen, on the
+    other hand, hands the user a specific list and that list needs a verdict for every
+    row - otherwise a name silently disappearing reads as "sell". So screened names with
+    no action from the backtest come back as WATCH, explicitly.  The explanation is
+    constrained to facts recorded by the run; this formatter never re-evaluates entry
+    conditions for a ticker the backtest did not price.
+    """
+
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return []
+    if isinstance(performance, PerformanceUnavailable):
+        return []
+    if recommendation_gate is not None and recommendation_gate.unmet_data_requirements:
+        return []
+
+    backtest = state.get("backtest") or {}
+    actions = [TickerAction.model_validate(item) for item in backtest.get("ticker_actions") or []]
+    decided = {action.ticker for action in actions}
+    as_of = actions[0].as_of_date if actions else None
+    traded = _traded_universe(backtest)
+    slots_full_reason = _slots_full_reason(backtest)
+    for card in cards:
+        for match in card.matches:
+            if match.ticker in decided:
+                continue
+            decided.add(match.ticker)
+            actions.append(
+                TickerAction(
+                    ticker=match.ticker,
+                    name=match.name or match.ticker,
+                    action="WATCH",
+                    reason=_watch_reason(
+                        match.ticker, traded=traded, slots_full_reason=slots_full_reason
+                    ),
+                    as_of_date=as_of or match.as_of_date,
+                    close=match.close,
+                )
+            )
+    order = {"SELL": 0, "BUY": 1, "HOLD": 2, "WATCH": 3}
+    return sorted(actions, key=lambda a: (order[a.action], a.ticker))
+
+
+_WATCH_OUTSIDE_UNIVERSE = (
+    "백테스트가 거래한 과거 시점(PIT) 유니버스에 없는 종목이라 백테스트가 판정한 적이 "
+    "없습니다. 오늘 스크리닝 조건에는 부합합니다."
+)
+_WATCH_NO_INSTRUCTION = "백테스트 마지막 거래일에 이 종목에 대한 신규 진입·청산 지시가 없었습니다."
+
+
+def _watch_reason(ticker: str, *, traded: set[str] | None, slots_full_reason: str | None) -> str:
+    if traded is not None and str(ticker).zfill(6) not in traded:
+        return _WATCH_OUTSIDE_UNIVERSE
+    if slots_full_reason is not None:
+        return slots_full_reason
+    return _WATCH_NO_INSTRUCTION
+
+
+def _traded_universe(backtest: Mapping[str, Any]) -> set[str] | None:
+    """The tickers actually priced by the backtest, if the run recorded them."""
+
+    payload = backtest.get("backtest_payload")
+    tickers = payload.get("tickers") if isinstance(payload, Mapping) else None
+    if not isinstance(tickers, list) or not tickers:
+        return None
+    return {str(ticker).zfill(6) for ticker in tickers}
+
+
+def _slots_full_reason(backtest: Mapping[str, Any]) -> str | None:
+    """Name a full-position limit only when the engine recorded both inputs."""
+
+    summary = backtest.get("engine_summary")
+    if not isinstance(summary, Mapping):
+        return None
+    held = summary.get("open_position_tickers")
+    if not isinstance(held, list):
+        return None
+    context = summary.get("ai_backtest_context")
+    limit = context.get("applied_max_positions") if isinstance(context, Mapping) else None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    if len(held) < limit:
+        return None
+    return (
+        f"백테스트 마지막 거래일에 전략 보유 슬롯 {len(held)}/{limit}이 모두 차 있어 "
+        "신규 진입이 제한된 상태였습니다."
+    )
+
+
+def _status_for_category(category: AmbiguityCode) -> EnvelopeStatus:
+    if category == AmbiguityCode.READY:
+        return EnvelopeStatus.READY
+    if category == AmbiguityCode.INFEASIBLE:
+        return EnvelopeStatus.REJECTED
+    return EnvelopeStatus.NEED_CLARIFICATION
+
+
+def _ambiguity_reason(category: AmbiguityCode) -> str:
+    return {
+        AmbiguityCode.NO_STRATEGY_INTENT: "안녕하세요! 분석할 투자 전략이나 매매 조건을 말씀해 주세요.",
+        AmbiguityCode.READY: "분석 가능한 전략 입력입니다.",
+        AmbiguityCode.INPUT_AMBIGUOUS: "요청한 조건 중 현재 데이터로 검증할 수 없는 항목이 있습니다.",
+        AmbiguityCode.TERM_UNKNOWN: "용어를 L1/L2 지식베이스와 매칭했지만 확인이 필요합니다.",
+        AmbiguityCode.CONFLICTING: "낮은 변동성과 단기 급등 목표가 서로 충돌합니다.",
+        AmbiguityCode.INFEASIBLE: "옵션/선물/가상자산은 AI MVP 지원 범위 밖입니다.",
+    }[category]
+
+
+def _availability_next_actions(data_availability: Mapping[str, Any]) -> list[str]:
+    if not data_availability:
+        return []
+    proxy_items = data_availability.get("proxy_used")
+    if isinstance(proxy_items, list) and proxy_items:
+        return ["재무/공시/뉴스 조건은 proxy 여부 확인"]
+    return []
+
+
+def _freshness_next_actions(evidence: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(evidence, Mapping) or not evidence.get("no_recommendation"):
+        return []
+    return ["최신 source manifest 확인 후 다시 실행"]
+
+
+def _route_after_ambiguity(state: QuantAgentState) -> str:
+    if state["ambiguity"]["category"] == AmbiguityCode.NO_STRATEGY_INTENT.value:
+        return "final"
+    return "data"
+
+
+def _route_after_data(state: QuantAgentState) -> str:
+    return "ready" if state["status"] == EnvelopeStatus.READY.value else "final"
+
+
+def _route_after_research(state: QuantAgentState) -> str:
+    """Only run code/backtest after Research has confirmed the rule is executable."""
+
+    return "ready" if state["status"] == EnvelopeStatus.READY.value else "final"
+
+
+def _trace_id(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _minimum_input_gaps(performance: PerformanceUnavailable) -> list[str]:
+    """Name the minimum-input rule and what the run actually had, as data not prose."""
+
+    facts = performance.safe_facts
+    gaps = [f"performance_unavailable:{performance.reason_code}"]
+    for observed_key, required_key in (
+        ("trading_days", "minimum_trading_days"),
+        ("ticker_count", "minimum_tickers"),
+    ):
+        observed = facts.get(observed_key)
+        required = facts.get(required_key)
+        if isinstance(observed, int) and isinstance(required, int) and observed < required:
+            gaps.append(f"{observed_key}:{observed} < {required_key}:{required}")
+    return gaps
+
+
+def _insufficient_input_reason(performance: PerformanceUnavailable) -> str:
+    if performance.reason_code == "insufficient_reliability":
+        return (
+            "입력 기간·유니버스가 최소 기준에 미달해 추천을 생성하지 않습니다. "
+            f"(거래일 {performance.safe_facts.get('trading_days')}일 / 최소 "
+            f"{performance.safe_facts.get('minimum_trading_days')}일, "
+            f"종목 {performance.safe_facts.get('ticker_count')}개 / 최소 "
+            f"{performance.safe_facts.get('minimum_tickers')}개)"
+        )
+    return (
+        "공개 가능한 백테스트 성과가 없어 추천 규칙 통과 여부를 판단할 수 없습니다. "
+        f"({performance.reason_code})"
+    )
+
+
+def _recommendation_gate(
+    state: QuantAgentState,
+    *,
+    performance: PerformanceAvailable | PerformanceUnavailable | None = None,
+) -> RecommendationGate | None:
+    freshness = state.get("freshness_evidence") or {}
+    if isinstance(freshness, Mapping) and freshness.get("no_recommendation"):
+        return RecommendationGate(
+            validated=False,
+            reason=str(
+                freshness.get("reason")
+                or "freshness 한계를 확인할 수 없어 추천을 생성하지 않습니다."
+            ),
+        )
+    if isinstance(performance, PerformanceUnavailable):
+        # The picks are validated by the backtest of the same rule. When that backtest
+        # could not be published - the input period or universe fell under the minimum
+        # data rule, or its method manifest was incomplete - there is nothing to
+        # validate against, and a metric threshold that was computed over too little
+        # history must not be reported as if the strategy had passed.
+        return RecommendationGate(
+            validated=False,
+            reason=_insufficient_input_reason(performance),
+            verification_complete=False,
+            unmet_data_requirements=_minimum_input_gaps(performance),
+        )
+    backtest_payload = state.get("backtest")
+    if backtest_payload is None:
+        return None
+    try:
+        backtest = CandidateBacktestResult.model_validate(backtest_payload)
+    except Exception:
+        return RecommendationGate(
+            validated=False,
+            reason="백테스트 결과를 해석할 수 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
+        )
+
+    selected = backtest.selected_candidate
+    if selected.metrics is None:
+        return RecommendationGate(
+            validated=False,
+            reason="검증 대상 백테스트 지표가 없어 추천 규칙 통과 여부를 판단할 수 없습니다.",
+        )
+
+    # `backtest_node` is the single owner of the objective-floor policy.  In
+    # particular, report-only mode records the same reasons but intentionally leaves
+    # `strategy_validated` true.  Recomputing the reasons here used to re-enforce that
+    # report-only floor in the UI, turning a visible warning into a false failure.
+    floor = state.get("objective_floor")
+    canonical_policy_verdict = isinstance(floor, Mapping) and isinstance(
+        state.get("strategy_validated"), bool
+    )
+    if canonical_policy_verdict:
+        raw_reasons = floor.get("reasons", ())
+        reasons = (
+            [str(reason) for reason in raw_reasons if str(reason).strip()]
+            if isinstance(raw_reasons, Sequence) and not isinstance(raw_reasons, str)
+            else []
+        )
+        validated = bool(state["strategy_validated"])
+    else:
+        # Historical result payloads predate `objective_floor`; retain their existing
+        # derivation rather than claiming a policy verdict that was never recorded.
+        reasons = _objective_gate_reasons(
+            # Preserve the remote main's walk-forward metric selection for legacy
+            # payloads, where no canonical policy verdict was recorded.
+            _floor_metrics(backtest),
+            backtest.engine_summary,
+            selection_mode=backtest.strategy_a.selection_mode,
+            benchmark_return=backtest.backtest_payload.get("benchmark_return"),
+        )
+        validated = not reasons
+    shortfalls = [item for item in reasons if not _is_data_gap_reason(item)]
+    gaps = [
+        *_benchmark_input_gaps(backtest),
+        *(item for item in reasons if _is_data_gap_reason(item)),
+    ]
+    report_only_shortfall = (
+        canonical_policy_verdict
+        and str(floor.get("mode", "")).strip().lower() == "report_only"
+        and not bool(floor.get("cleared"))
+    )
+    reason = (
+        "백테스트 목표 기준은 아직 충족하지 못했지만 report_only 정책에 따라 추천을 "
+        "차단하지 않습니다: " + "; ".join(reasons)
+        if report_only_shortfall
+        else _gate_reason(validated, shortfalls, gaps)
+    )
+    return RecommendationGate(
+        validated=validated,
+        reason=reason,
+        verification_complete=not gaps,
+        unmet_objective_criteria=shortfalls,
+        unmet_data_requirements=gaps,
+    )
+
+
+# These messages describe inputs that did not arrive, not an observed metric below its
+# threshold. They must remain distinct from a measured strategy shortfall.
+_DATA_GAP_REASON_MARKERS = ("is unavailable", "계산할 수 없음", "비교 구간이 없습니다")
+
+
+def _is_data_gap_reason(reason: str) -> bool:
+    return any(marker in reason for marker in _DATA_GAP_REASON_MARKERS)
+
+
+def _benchmark_input_gaps(backtest: CandidateBacktestResult) -> list[str]:
+    if backtest.strategy_a.selection_mode != "automatic":
+        return []
+    payload = backtest.backtest_payload
+    benchmark = payload.get("benchmark") if isinstance(payload, Mapping) else None
+    primary = benchmark.get("primary") if isinstance(benchmark, Mapping) else None
+    if isinstance(primary, Mapping) and primary.get("available"):
+        return []
+    detail = ""
+    if isinstance(primary, Mapping):
+        stated = str(primary.get("unavailable_reason") or "").strip()
+        detail = f" ({stated})" if stated else ""
+    return [
+        (
+            "공식 KOSPI/KOSDAQ TR 벤치마크 시계열이 아직 적재되지 않아 "
+            f"벤치마크 대비 검증을 완료하지 못했습니다{detail}"
+        )
+    ]
+
+
+def _gate_reason(validated: bool, shortfalls: Sequence[str], gaps: Sequence[str]) -> str:
+    if validated and not gaps:
+        return "objective gate를 모두 통과해 오늘의 추천을 유지합니다."
+    if validated:
+        return (
+            "측정된 objective 지표는 모두 통과했지만, 검증에 필요한 데이터가 없어 "
+            "검증을 끝내지 못했습니다: " + "; ".join(gaps)
+        )
+    if shortfalls and gaps:
+        return (
+            "objective 조건 미충족: "
+            + ", ".join(shortfalls)
+            + " / 그리고 아직 검증하지 못한 항목: "
+            + "; ".join(gaps)
+        )
+    if shortfalls:
+        return "objective 조건 미충족: " + ", ".join(shortfalls)
+    return (
+        "성과가 기준에 미달한 것이 아니라, 검증에 필요한 데이터가 아직 없어 "
+        "판정을 내리지 못했습니다: " + "; ".join(gaps)
+    )
+
+
+def _objective_gate_reasons(
+    metrics: BacktestMetrics,
+    engine_summary: Mapping[str, Any],
+    *,
+    selection_mode: str = "standard",
+    benchmark_return: Any | None = None,
+) -> list[str]:
+    trade_count = _summary_float_default(engine_summary, "effective_trade_count", 0.0)
+    reasons: list[str] = []
+    if trade_count < MIN_OBJECTIVE_TRADES:
+        reasons.append(
+            f"거래 횟수 {trade_count:.0f}회로 MIN_OBJECTIVE_TRADES={MIN_OBJECTIVE_TRADES} 조건 미달"
+        )
+    if metrics.out_sample_sharpe is None:
+        reasons.append("워크포워드 외부 샤프비율을 신뢰성 있게 계산할 수 없음")
+    elif metrics.out_sample_sharpe < MIN_OBJECTIVE_SHARPE:
+        reasons.append(
+            f"보유 구간 외부 샤프비율 {metrics.out_sample_sharpe:.4f} < {MIN_OBJECTIVE_SHARPE:.2f}"
+        )
+    if metrics.max_drawdown < MAX_OBJECTIVE_DRAWDOWN:
+        reasons.append(
+            f"최대 낙폭 {metrics.max_drawdown:.4f} < {MAX_OBJECTIVE_DRAWDOWN:.2f} (리스크 허용치 미달)"
+        )
+    if selection_mode == "automatic":
+        reasons.extend(_benchmark_objective_reasons(metrics))
+    return reasons
+
+
+def _record_analysis_memory(state: QuantAgentState, status: EnvelopeStatus) -> None:
+    """Note how this run turned out, for the next analysis of the same strategy."""
+
+    memory = AnalysisMemory.from_env()
+    if not memory.enabled:
+        return
+    strategy = state.get("strategy_spec") or {}
+    strategy_id = str(strategy.get("strategy_id") or "")
+    if not strategy_id:
+        return
+
+    data = state.get("data") or {}
+    pipeline = data.get("pipeline_data_source") or {}
+    relaxation = pipeline.get("screening_relaxation") or {}
+    availability = data.get("data_availability") or {}
+    performance = (
+        project_public_performance(
+            state.get("backtest"),
+            price_rows=state.get("price_rows"),
+            pipeline_data_source=state.get("data", {}).get("pipeline_data_source"),
+        )
+        or {}
+    )
+    payload = performance.performance if isinstance(performance, PerformanceAvailable) else None
+    metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
+
+    try:
+        memory.record(
+            strategy_id,
+            query=str(state.get("user_query") or ""),
+            outcome=status.value,
+            candidate_count=len(data.get("screening_candidates") or []),
+            metrics=metrics or {},
+            relaxation_rounds=int(relaxation.get("relaxation_rounds") or 0),
+            unmet_requirements=[
+                str(item.get("label"))
+                for item in availability.get("unsupported_capabilities") or []
+            ],
+            note=(state.get("strategy_revision") or {}).get("rationale"),
+        )
+    except Exception:
+        # Memory is an optimisation; never let it take down a completed analysis.
+        _logger.warning("could not record analysis memory", exc_info=True)
+
+
+# Public performance helpers are sourced from quant_performance for a stable behavior contract.
+from ai_graph.quant_performance import (  # noqa: E402, F401
+    _metric_detail,
+    build_public_backtest_performance,
+    project_public_performance,
+)

@@ -1,0 +1,190 @@
+import { useEffect, useState } from "react";
+import { AppPage } from "./pages/AppPage";
+import { AuthCallbackPage } from "./pages/AuthCallbackPage";
+import { AuthRequiredPage } from "./pages/AuthRequiredPage";
+import { EmailReportDetailPage } from "./pages/EmailReportDetailPage";
+import { LandingPage } from "./pages/LandingPage";
+import { LegalPage } from "./pages/LegalPage";
+import { LoginPage } from "./pages/LoginPage";
+import { ProfilePage } from "./pages/ProfilePage";
+import { WorkspaceReportDetailPage } from "./pages/WorkspaceReportDetailPage";
+import { ReportsPage } from "./pages/ReportsPage";
+import { SearchPage } from "./pages/SearchPage";
+import { UnsubscribePage } from "./pages/UnsubscribePage";
+import { AsyncState } from "./components/common/AsyncState";
+import { MarketTicker } from "./components/layout/MarketTicker";
+import {
+  bootstrapSessionFromCookie,
+  getCurrentSession,
+  isSessionRecentlyValidated,
+  validateCurrentSession,
+} from "./api/authClient";
+import {
+  ROUTES,
+  getCurrentPathWithSearch,
+  parseEmailReportDetailId,
+  parseReportDetailId,
+  sanitizeReturnTo,
+} from "./config/routes";
+import type { AuthSession } from "./types/auth";
+
+function normalizePath(pathname: string) {
+  return pathname.replace(/\/+$/, "") || "/";
+}
+
+function isProtectedRoute(path: string) {
+  return (
+    path === ROUTES.app ||
+    path.startsWith(`${ROUTES.app}/`) ||
+    path === ROUTES.reports ||
+    parseReportDetailId(path) !== null ||
+    parseEmailReportDetailId(path) !== null ||
+    path === ROUTES.me ||
+    path === ROUTES.notifications ||
+    path === ROUTES.search
+  );
+}
+
+export default function App() {
+  return <div className="market-ticker-page"><AppRoutes /><MarketTicker /></div>;
+}
+
+function AppRoutes() {
+  const path = normalizePath(window.location.pathname);
+  const protectedRoute = isProtectedRoute(path);
+  // There is no client-side router, so every navigation remounts the whole app. Blocking
+  // the first paint on /auth/me meant a full-screen "세션을 확인하는 중" on every single
+  // click. The cached session renders immediately and revalidation happens behind it; only
+  // an actual 401 (validateCurrentSession returning null) takes the user to the login page.
+  const [session, setSession] = useState<AuthSession | null>(getCurrentSession);
+  // A cookie-authenticated user with no cached SPA session — the normal state after the
+  // backend's server-side OAuth callback in the combined production topology — must be
+  // admitted, not walled. Until the cookie bootstrap resolves we cannot tell "signed out"
+  // apart from "session lives only in the cookie", so hold the protected-route gate closed
+  // meanwhile instead of flashing the login wall.
+  const [bootstrappingCookieSession, setBootstrappingCookieSession] = useState(
+    () => protectedRoute && session === null,
+  );
+
+  useEffect(() => {
+    if (!protectedRoute || session !== null) {
+      return;
+    }
+    let cancelled = false;
+    bootstrapSessionFromCookie()
+      .then((cookieSession) => {
+        if (!cancelled) {
+          setSession(cookieSession);
+        }
+      })
+      .catch((error: unknown) => {
+        // No valid cookie session (or the check failed): fall through to the login wall.
+        console.warn("쿠키 세션 부트스트랩에 실패해 로그인 화면으로 이동합니다.", error);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setBootstrappingCookieSession(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // session is null here and the bootstrap either sets it or leaves it null; re-running
+    // on a null->null no-op would not loop, but keep the dependency explicit.
+  }, [protectedRoute, session]);
+
+  useEffect(() => {
+    if (!protectedRoute || !session || isSessionRecentlyValidated(session)) {
+      return;
+    }
+    let cancelled = false;
+    validateCurrentSession()
+      .then((validatedSession) => {
+        if (!cancelled) {
+          setSession(validatedSession);
+        }
+      })
+      .catch((error: unknown) => {
+        // A network blip is not a signed-out user. Keep what is on screen and let the
+        // next navigation - or the next authenticated request's own 401 - decide.
+        console.warn("로그인 세션 재확인에 실패해 기존 세션을 유지합니다.", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Only the identity matters here; re-running on every session object would loop.
+  }, [protectedRoute, session?.user.id]);
+
+  if (path === ROUTES.home) {
+    return <LandingPage />;
+  }
+
+  if (path === ROUTES.login) {
+    return <LoginPage returnTo={sanitizeReturnTo(new URLSearchParams(window.location.search).get("returnTo"))} />;
+  }
+
+  if (path === ROUTES.authCallback) {
+    return <AuthCallbackPage />;
+  }
+
+  if (path === ROUTES.terms) {
+    return <LegalPage kind="terms" />;
+  }
+
+  if (path === ROUTES.privacy) {
+    return <LegalPage kind="privacy" />;
+  }
+
+  if (path === ROUTES.disclaimer) {
+    return <LegalPage kind="disclaimer" />;
+  }
+
+  if (path === ROUTES.unsubscribe) {
+    return <UnsubscribePage />;
+  }
+
+  if (protectedRoute && !session) {
+    if (bootstrappingCookieSession) {
+      return <AsyncState title="세션을 확인하는 중" description="로그인 상태를 확인하고 있습니다." tone="loading" />;
+    }
+    return <AuthRequiredPage returnTo={getCurrentPathWithSearch()} />;
+  }
+
+  if (path === ROUTES.app) {
+    return <AppPage />;
+  }
+
+  if (path === ROUTES.me) {
+    return <ProfilePage initialTab="profile" />;
+  }
+
+  if (path === ROUTES.notifications) {
+    return <ProfilePage initialTab="notifications" />;
+  }
+
+  if (path === ROUTES.search) {
+    return <SearchPage />;
+  }
+
+  if (path === ROUTES.reports) {
+    return <ReportsPage />;
+  }
+
+  const emailReportDetailId = parseEmailReportDetailId(path);
+  if (emailReportDetailId) {
+    return <EmailReportDetailPage id={emailReportDetailId} />;
+  }
+
+  const reportDetailId = parseReportDetailId(path);
+  if (reportDetailId) {
+    return <WorkspaceReportDetailPage id={reportDetailId} />;
+  }
+
+  return (
+    <main className="not-found">
+      <h1>페이지를 찾을 수 없습니다</h1>
+      <p>Figma HI-FI 구현 대상 route가 아닙니다.</p>
+      <a href={ROUTES.home}>홈으로 가기</a>
+    </main>
+  );
+}

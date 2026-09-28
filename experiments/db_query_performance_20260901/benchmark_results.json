@@ -1,0 +1,2708 @@
+{
+  "measured_at_utc": "2026-09-01T00:12:43.460191+00:00",
+  "source": "postgres",
+  "dsn_env": "AI_DATABASE_DSN",
+  "database_dsn_exposed": false,
+  "query_label": "natural-language RSI oversold sector screen",
+  "screening_profile": "rsi_rebound",
+  "rsi_entry_operator": "lte",
+  "rsi_entry_threshold": 30.0,
+  "sector": "반도체",
+  "as_of": "2026-08-28",
+  "benchmark_timeout_ms": 120000,
+  "repetitions": 3,
+  "rollback_policy": "connection close drops all TEMP objects",
+  "strategies": [
+    {
+      "strategy_id": "S01",
+      "title": "현재 mart feature-frame SQL",
+      "family": "baseline",
+      "description": "현재 코드가 사용하는 feature-frame 뷰 대체 SQL과 동일한 읽기.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 2e-06,
+          "query_seconds": 0.057727,
+          "wall_seconds": 0.286698,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 3e-06,
+          "query_seconds": 0.062219,
+          "wall_seconds": 0.255409,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 3e-06,
+          "query_seconds": 0.064581,
+          "wall_seconds": 0.324314,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 3e-06,
+      "query_seconds": 0.062219,
+      "wall_seconds": 0.286698,
+      "db_seconds": 0.062222,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S02",
+      "title": "CTE predicate pushdown",
+      "family": "planner",
+      "description": "RSI predicate를 외부 SELECT가 아닌 typed CTE 경계 안에서 적용.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 2e-06,
+          "query_seconds": 0.053709,
+          "wall_seconds": 0.283847,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 2e-06,
+          "query_seconds": 0.032738,
+          "wall_seconds": 0.188839,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 2e-06,
+          "query_seconds": 0.038782,
+          "wall_seconds": 0.202403,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 2e-06,
+      "query_seconds": 0.038782,
+      "wall_seconds": 0.202403,
+      "db_seconds": 0.038784,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S03",
+      "title": "CTE MATERIALIZED",
+      "family": "planner",
+      "description": "공통 frame CTE를 명시적으로 materialize.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 4e-06,
+          "query_seconds": 0.058683,
+          "wall_seconds": 0.22817,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 2e-06,
+          "query_seconds": 0.079408,
+          "wall_seconds": 0.218157,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 2e-06,
+          "query_seconds": 0.050424,
+          "wall_seconds": 0.188304,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 2e-06,
+      "query_seconds": 0.058683,
+      "wall_seconds": 0.218157,
+      "db_seconds": 0.058687,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S04",
+      "title": "TEMP table from feature frame",
+      "family": "materialization",
+      "description": "실제 one-day feature frame을 TEMP TABLE로 물질화.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.063953,
+          "query_seconds": 0.043825,
+          "wall_seconds": 0.296859,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.056021,
+          "query_seconds": 0.03164,
+          "wall_seconds": 0.303549,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.066844,
+          "query_seconds": 0.029087,
+          "wall_seconds": 0.372741,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.063953,
+      "query_seconds": 0.03164,
+      "wall_seconds": 0.303549,
+      "db_seconds": 0.095931,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S05",
+      "title": "TEMP table + ANALYZE",
+      "family": "statistics",
+      "description": "TEMP TABLE 생성 후 통계 수집.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.207149,
+          "query_seconds": 0.02173,
+          "wall_seconds": 0.406011,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.227238,
+          "query_seconds": 0.065026,
+          "wall_seconds": 0.493353,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.270886,
+          "query_seconds": 0.03232,
+          "wall_seconds": 0.557578,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.227238,
+      "query_seconds": 0.03232,
+      "wall_seconds": 0.493353,
+      "db_seconds": 0.292264,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S06",
+      "title": "TEMP B-tree sector",
+      "family": "btree",
+      "description": "sector 선택도에 대한 B-tree.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.140923,
+          "query_seconds": 0.033106,
+          "wall_seconds": 0.393563,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.209858,
+          "query_seconds": 0.020678,
+          "wall_seconds": 0.647678,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.153651,
+          "query_seconds": 0.017771,
+          "wall_seconds": 0.335571,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.153651,
+      "query_seconds": 0.020678,
+      "wall_seconds": 0.393563,
+      "db_seconds": 0.174029,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S07",
+      "title": "TEMP B-tree sector/rsi",
+      "family": "btree",
+      "description": "sector와 RSI predicate를 함께 지원하는 복합 B-tree.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.171508,
+          "query_seconds": 0.034361,
+          "wall_seconds": 0.451692,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.195852,
+          "query_seconds": 0.033,
+          "wall_seconds": 0.471488,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.1924,
+          "query_seconds": 0.025149,
+          "wall_seconds": 0.387364,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.1924,
+      "query_seconds": 0.033,
+      "wall_seconds": 0.451692,
+      "db_seconds": 0.217549,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S08",
+      "title": "TEMP B-tree rsi/sector",
+      "family": "btree",
+      "description": "RSI 선행 복합 B-tree 대조군.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.135015,
+          "query_seconds": 0.022754,
+          "wall_seconds": 0.304086,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.139148,
+          "query_seconds": 0.036639,
+          "wall_seconds": 0.332459,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.156258,
+          "query_seconds": 0.03586,
+          "wall_seconds": 0.375534,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.139148,
+      "query_seconds": 0.03586,
+      "wall_seconds": 0.332459,
+      "db_seconds": 0.175787,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S09",
+      "title": "covering index",
+      "family": "index-only",
+      "description": "필요 컬럼을 INCLUDE한 covering index.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.154251,
+          "query_seconds": 0.021623,
+          "wall_seconds": 0.384597,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.151786,
+          "query_seconds": 0.043607,
+          "wall_seconds": 0.361522,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.127121,
+          "query_seconds": 0.020586,
+          "wall_seconds": 0.318175,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.151786,
+      "query_seconds": 0.021623,
+      "wall_seconds": 0.361522,
+      "db_seconds": 0.175874,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S10",
+      "title": "partial RSI index",
+      "family": "partial-index",
+      "description": "현재 전략의 RSI 조건을 partial index predicate로 고정.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.11343,
+          "query_seconds": 0.025714,
+          "wall_seconds": 0.307444,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.222491,
+          "query_seconds": 0.039377,
+          "wall_seconds": 0.489256,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.140134,
+          "query_seconds": 0.030972,
+          "wall_seconds": 0.363252,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.140134,
+      "query_seconds": 0.030972,
+      "wall_seconds": 0.363252,
+      "db_seconds": 0.171106,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S11",
+      "title": "BRIN time index",
+      "family": "brin",
+      "description": "시계열 테이블에 적합한 BRIN 대조군.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.118328,
+          "query_seconds": 0.026072,
+          "wall_seconds": 0.32497,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.10832,
+          "query_seconds": 0.01818,
+          "wall_seconds": 0.312478,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.127973,
+          "query_seconds": 0.044726,
+          "wall_seconds": 0.357138,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.118328,
+      "query_seconds": 0.026072,
+      "wall_seconds": 0.32497,
+      "db_seconds": 0.1444,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S12",
+      "title": "JSONB raw table + ANALYZE",
+      "family": "jsonb",
+      "description": "JSONB 원본을 유지하되 planner 통계를 수집.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.200423,
+          "query_seconds": 0.031909,
+          "wall_seconds": 0.440369,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.182604,
+          "query_seconds": 0.044822,
+          "wall_seconds": 0.439923,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.234148,
+          "query_seconds": 0.049573,
+          "wall_seconds": 0.558588,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.200423,
+      "query_seconds": 0.044822,
+      "wall_seconds": 0.440369,
+      "db_seconds": 0.232332,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S13",
+      "title": "JSONB GIN default",
+      "family": "jsonb",
+      "description": "JSONB containment/operator 검색용 기본 GIN.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.105521,
+          "query_seconds": 0.023343,
+          "wall_seconds": 0.506445,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.139283,
+          "query_seconds": 0.036902,
+          "wall_seconds": 0.422299,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.111438,
+          "query_seconds": 0.066155,
+          "wall_seconds": 0.388803,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.111438,
+      "query_seconds": 0.036902,
+      "wall_seconds": 0.422299,
+      "db_seconds": 0.176185,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S14",
+      "title": "JSONB GIN path_ops",
+      "family": "jsonb",
+      "description": "JSONB containment 검색용 path_ops GIN.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.080177,
+          "query_seconds": 0.019238,
+          "wall_seconds": 0.296781,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.073159,
+          "query_seconds": 0.022946,
+          "wall_seconds": 0.243683,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.105719,
+          "query_seconds": 0.023337,
+          "wall_seconds": 0.281346,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.080177,
+      "query_seconds": 0.022946,
+      "wall_seconds": 0.281346,
+      "db_seconds": 0.099415,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S15",
+      "title": "typed RSI projection",
+      "family": "jsonb",
+      "description": "RSI JSONB path를 numeric 컬럼으로 선계산.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.093395,
+          "query_seconds": 0.067731,
+          "wall_seconds": 0.356305,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.105397,
+          "query_seconds": 0.026385,
+          "wall_seconds": 0.360258,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.100856,
+          "query_seconds": 0.04886,
+          "wall_seconds": 0.388353,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.100856,
+      "query_seconds": 0.04886,
+      "wall_seconds": 0.360258,
+      "db_seconds": 0.149716,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S16",
+      "title": "generated RSI column",
+      "family": "jsonb",
+      "description": "JSONB RSI path를 generated stored column으로 고정.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.065036,
+          "query_seconds": 0.017267,
+          "wall_seconds": 0.228978,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.080586,
+          "query_seconds": 0.02245,
+          "wall_seconds": 0.246694,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.083513,
+          "query_seconds": 0.018935,
+          "wall_seconds": 0.287693,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.080586,
+      "query_seconds": 0.018935,
+      "wall_seconds": 0.246694,
+      "db_seconds": 0.102448,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S17",
+      "title": "typed wide projection",
+      "family": "jsonb",
+      "description": "전략에 필요한 typed indicator projection을 TEMP TABLE에 저장.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.116316,
+          "query_seconds": 0.032939,
+          "wall_seconds": 0.353591,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.111471,
+          "query_seconds": 0.038526,
+          "wall_seconds": 0.373136,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.113022,
+          "query_seconds": 0.054917,
+          "wall_seconds": 0.408255,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.113022,
+      "query_seconds": 0.038526,
+      "wall_seconds": 0.373136,
+      "db_seconds": 0.149997,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S18",
+      "title": "TEMP materialized view",
+      "family": "materialization",
+      "description": "PostgreSQL의 TEMP MATERIALIZED VIEW 지원 여부를 실제로 검증하는 격리 실험.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "unsupported",
+      "samples": [
+        {
+          "status": "unsupported",
+          "wall_seconds": 0.217476,
+          "error_type": "SyntaxError",
+          "error": "syntax error at or near \"MATERIALIZED\"\nLINE 2:         CREATE TEMP MATERIALIZED VIEW tmp_feature_mv AS\n                            ^"
+        },
+        {
+          "status": "unsupported",
+          "wall_seconds": 0.278036,
+          "error_type": "SyntaxError",
+          "error": "syntax error at or near \"MATERIALIZED\"\nLINE 2:         CREATE TEMP MATERIALIZED VIEW tmp_feature_mv AS\n                            ^"
+        },
+        {
+          "status": "unsupported",
+          "wall_seconds": 0.276212,
+          "error_type": "SyntaxError",
+          "error": "syntax error at or near \"MATERIALIZED\"\nLINE 2:         CREATE TEMP MATERIALIZED VIEW tmp_feature_mv AS\n                            ^"
+        }
+      ],
+      "error_type": "SyntaxError",
+      "error": "syntax error at or near \"MATERIALIZED\"\nLINE 2:         CREATE TEMP MATERIALIZED VIEW tmp_feature_mv AS\n                            ^",
+      "traceback_tail": [
+        "    conn.execute(\"\"\"",
+        "  File \"C:\\Users\\윤민호\\Desktop\\Quant-agent\\.venv\\Lib\\site-packages\\psycopg\\connection.py\", line 269, in execute",
+        "    raise ex.with_traceback(None)",
+        "psycopg.errors.SyntaxError: syntax error at or near \"MATERIALIZED\"",
+        "LINE 2:         CREATE TEMP MATERIALIZED VIEW tmp_feature_mv AS",
+        "                            ^"
+      ]
+    },
+    {
+      "strategy_id": "S19",
+      "title": "sector partition pruning",
+      "family": "partitioning",
+      "description": "TEMP table을 sector LIST partition으로 분할.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.193253,
+          "query_seconds": 0.028471,
+          "wall_seconds": 0.474344,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.24169,
+          "query_seconds": 0.040725,
+          "wall_seconds": 0.566504,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.172059,
+          "query_seconds": 0.072927,
+          "wall_seconds": 0.393177,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.193253,
+      "query_seconds": 0.040725,
+      "wall_seconds": 0.474344,
+      "db_seconds": 0.244986,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S20",
+      "title": "time partition pruning",
+      "family": "partitioning",
+      "description": "TEMP table을 time RANGE partition으로 분할.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.220928,
+          "query_seconds": 0.019023,
+          "wall_seconds": 0.415803,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.332211,
+          "query_seconds": 0.028165,
+          "wall_seconds": 0.580821,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.197116,
+          "query_seconds": 0.029437,
+          "wall_seconds": 0.432369,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.220928,
+      "query_seconds": 0.028165,
+      "wall_seconds": 0.432369,
+      "db_seconds": 0.239951,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S21",
+      "title": "filter relation join",
+      "family": "join-shape",
+      "description": "sector predicate를 작은 relation과 JOIN.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.149167,
+          "query_seconds": 0.018405,
+          "wall_seconds": 0.311104,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.129601,
+          "query_seconds": 0.017241,
+          "wall_seconds": 0.325902,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.128558,
+          "query_seconds": 0.0171,
+          "wall_seconds": 0.336052,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.129601,
+      "query_seconds": 0.017241,
+      "wall_seconds": 0.325902,
+      "db_seconds": 0.146842,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S22",
+      "title": "ANY(array) predicate",
+      "family": "predicate",
+      "description": "scalar equality 대신 ANY(array) predicate.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.092781,
+          "query_seconds": 0.026349,
+          "wall_seconds": 0.290774,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.095001,
+          "query_seconds": 0.038908,
+          "wall_seconds": 0.392816,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.101282,
+          "query_seconds": 0.018148,
+          "wall_seconds": 0.372426,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.095001,
+      "query_seconds": 0.026349,
+      "wall_seconds": 0.372426,
+      "db_seconds": 0.11943,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S23",
+      "title": "prepared statement",
+      "family": "plan-cache",
+      "description": "동일 SQL을 PREPARE/EXECUTE로 반복 실행.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.114686,
+          "query_seconds": 0.024027,
+          "wall_seconds": 0.285192,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.126446,
+          "query_seconds": 0.018693,
+          "wall_seconds": 0.299708,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.154148,
+          "query_seconds": 0.0195,
+          "wall_seconds": 0.36564,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.126446,
+      "query_seconds": 0.0195,
+      "wall_seconds": 0.299708,
+      "db_seconds": 0.145139,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S24",
+      "title": "narrow projection",
+      "family": "projection",
+      "description": "결과에 필요한 ticker/name/sector/close/RSI만 반환.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.115086,
+          "query_seconds": 0.049081,
+          "wall_seconds": 0.389821,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.106037,
+          "query_seconds": 0.033278,
+          "wall_seconds": 0.363552,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.085321,
+          "query_seconds": 0.070116,
+          "wall_seconds": 0.331435,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.106037,
+      "query_seconds": 0.049081,
+      "wall_seconds": 0.363552,
+      "db_seconds": 0.155437,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S25",
+      "title": "work_mem benchmark setting",
+      "family": "session-setting",
+      "description": "정렬/해시를 위한 세션 work_mem 상향.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.107699,
+          "query_seconds": 0.018825,
+          "wall_seconds": 0.279312,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.090621,
+          "query_seconds": 0.017695,
+          "wall_seconds": 0.249836,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.101882,
+          "query_seconds": 0.021078,
+          "wall_seconds": 0.288553,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.101882,
+      "query_seconds": 0.018825,
+      "wall_seconds": 0.279312,
+      "db_seconds": 0.12296,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S26",
+      "title": "parallel workers benchmark setting",
+      "family": "parallel",
+      "description": "세션 parallel worker 상한을 설정.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.121056,
+          "query_seconds": 0.035041,
+          "wall_seconds": 0.317912,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.158855,
+          "query_seconds": 0.036945,
+          "wall_seconds": 0.487926,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.129351,
+          "query_seconds": 0.032357,
+          "wall_seconds": 0.302646,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.129351,
+      "query_seconds": 0.035041,
+      "wall_seconds": 0.317912,
+      "db_seconds": 0.161708,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    },
+    {
+      "strategy_id": "S27",
+      "title": "JIT off",
+      "family": "jit",
+      "description": "짧은 반복 query에서 JIT compilation 비용을 제거하는 대조군.",
+      "settings": {},
+      "repetitions": 3,
+      "status": "ok",
+      "samples": [
+        {
+          "status": "ok",
+          "setup_seconds": 0.12609,
+          "query_seconds": 0.017839,
+          "wall_seconds": 0.28911,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.151704,
+          "query_seconds": 0.023459,
+          "wall_seconds": 0.415287,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        },
+        {
+          "status": "ok",
+          "setup_seconds": 0.159272,
+          "query_seconds": 0.030887,
+          "wall_seconds": 0.39617,
+          "signature": {
+            "row_count": 3,
+            "rows": [
+              [
+                "025560",
+                "25.09717620862152"
+              ],
+              [
+                "096610",
+                ""
+              ],
+              [
+                "183300",
+                "26.480183300317435"
+              ]
+            ]
+          }
+        }
+      ],
+      "setup_seconds": 0.151704,
+      "query_seconds": 0.023459,
+      "wall_seconds": 0.39617,
+      "db_seconds": 0.175163,
+      "signature": {
+        "row_count": 3,
+        "rows": [
+          [
+            "025560",
+            "25.09717620862152"
+          ],
+          [
+            "096610",
+            ""
+          ],
+          [
+            "183300",
+            "26.480183300317435"
+          ]
+        ]
+      },
+      "signature_consistent": true
+    }
+  ]
+}
