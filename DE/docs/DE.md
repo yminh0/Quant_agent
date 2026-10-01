@@ -142,14 +142,22 @@ meta        위 전체 흐름의 실행 이력, API 로그, 품질 이슈, linea
 | `migrations/002_data_engineering_runtime.sql` | DART corp-code 매핑 테이블과 runtime mart view 추가. |
 | `migrations/003_quality_observability_lineage.sql` | API 관측성 컬럼, lineage metadata, `feature.adjusted_ohlcv_daily`, ticker 기반 TA 테이블, KIS adjusted mart view 추가. |
 | `migrations/004_mart_symbol_metadata.sql` | 종목 메타데이터 보강, ticker TA 기준 mart view 재작성. |
-| `migrations/005_seibro_analyst_report_summary.sql` | SEIBro 분석리포트 요약 raw landing table 보장. |
 | `migrations/006_symbol_security_type_classification.sql` | 보통주/우선주/SPAC/리츠/ETF/ETN/인프라펀드/기타 분류 함수와 common-stock universe helper view 추가. |
-| `migrations/007_common_stock_mart_views.sql` | 보통주 전용 `mart.common_stock_feature_frame_asof`, `mart.common_stock_universe_asof` 정의 대상. |
+| `migrations/007_common_stock_mart_views.sql` | 보통주 전용 `mart.common_stock_feature_frame_asof`, `mart.common_stock_universe_asof` 생성. |
+| `migrations/008`~`010_hankyung_consensus_pdf_temp*.sql` | 한경 컨센서스 PDF 추출 임시 landing 테이블, 메타데이터, crawler seed. |
+| `migrations/012_symbol_sector_metadata.sql` | 상장사 섹터 스냅샷 컬럼 추가, 보통주 mart view 재작성. |
+| `migrations/013_krx_official_benchmark_tr.sql` | 자동 전략 수용 기준용 KOSPI/KOSDAQ 공식 총수익(TR) 벤치마크 입력. |
+| `migrations/013_point_in_time_universe_membership.sql` | 백테스트용 mart view의 PIT universe membership. |
+| `migrations/014_backtest_readiness.sql` | 명시적 availability, WICS 이력, DART filing 버전. |
+| `migrations/015_krx_index_membership_history.sql` | KOSPI200/KOSDAQ150 구성종목 PIT 구간. |
+| `migrations/016_lineage_event_idempotency.sql` | lineage upsert용 유니크 인덱스. 트랜잭션 밖에서, 기존 중복 행 정리 후 적용. |
+
+`raw.analyst_report_summary`(SEIBro 분석리포트 요약 landing)는 001에서 생성된다. `005`, `011` 번호는 비어 있다.
 
 적용 순서:
 
 ```text
-001 → 002 → 003 → 004 → 005 → 006 → 007
+001 → 002 → 003 → 004 → 006 → 007 → 008 → 009 → 010 → 012 → 013(benchmark_tr) → 013(point_in_time) → 014 → 015 → 016
 ```
 
 ## 4. 10년 데이터 수집·가공 스크립트
@@ -394,7 +402,7 @@ python scripts/backfill_seibro_analyst_reports.py `
 | `scripts/refresh_symbol_metadata.py` | 이미 적재된 OHLCV 관측치를 기준으로 종목 상장/재상장/상폐 구간과 종목 메타데이터 갱신. 외부 API 호출 없음. |
 | `scripts/classify_symbol_security_types.py` | `006_symbol_security_type_classification.sql` 적용 또는 검증. 보통주/우선주/SPAC/리츠/ETF/ETN/인프라펀드/기타 분류와 common-stock universe 검증. |
 | `scripts/ingest_dart_bok_history.py` | BOK ECOS와 OpenDART 장기 수집용 schema-first 적재 스크립트. 실제 DB 컬럼/PK/UNIQUE를 먼저 스캔하고 존재하는 컬럼만 적재. BOK 월별 유가는 `--bok-series-json`으로 `902Y003`의 WTI/Dubai/Brent 항목을 지정해 수집. |
-| `scripts/ingest_external_data.py` | BOK/DART/SEIBro 단건성 운영 CLI. `bok-series`, `dart-corp-codes`, `dart-financial`, `seibro-reports` job 실행. |
+| `scripts/ingest_external_data.py` | BOK/DART/KIND 단건성 운영 CLI. `bok-series`, `dart-corp-codes`, `dart-financial`, `kind-sector` job 실행. |
 | `scripts/compute_ta_indicators.py` | 초기 symbol_id 기반 TA-Lib 계산 CLI. 이후 ticker/segment 기반 `compute_technical_indicators_pipeline.py`가 주 경로로 전환. |
 | `scripts/run_source_pilot.py` | KRX/KIS source pilot 실행. primary source 결정 전 API 정상화와 품질 기준 확인용. |
 | `scripts/apply_migrations.ps1` | SQL migration 적용 보조 PowerShell 스크립트. |
@@ -497,14 +505,13 @@ python scripts/backfill_seibro_analyst_reports.py `
 | ticker 기반 TA로 왜 전환했는가 | symbol_id만 쓰면 재상장/종목 변경/segment 처리가 약함. ticker/base_ticker/segment_id 기준으로 상장 구간과 재상장 구간을 분리하기 위해 전환. |
 | SEIBro raw와 feature가 왜 분리됐는가 | 현재 10년치 요약 raw row는 적재 완료. sentiment/universe feature는 후속 모델링 단계에서 별도 변환 가능하도록 분리. |
 | 품질 이슈 row가 많은 이유 | 누락일, stale, volume anomaly 등 규칙 기반 이슈를 모두 이벤트로 남기는 구조. 데이터 삭제가 아니라 진단용 로그. |
-| 보통주만 모은 객체는 무엇인가 | `meta.view_common_stock_universe`가 KOSPI/KOSDAQ 상장 보통주 helper view. 공용 DB 기준 합계 2,554개. 백테스트 입력은 migration 007의 `mart.common_stock_feature_frame_asof`로 고정 예정. |
-| 서버 이관 시 필요한 것 | migration 001~007 적용 후 data dump/restore. mart view는 데이터가 아니라 migration으로 재생성. 단, 현재 repo의 007 파일은 비어 있어 SQL 보강 필요. |
+| 보통주만 모은 객체는 무엇인가 | `meta.view_common_stock_universe`가 KOSPI/KOSDAQ 상장 보통주 helper view. 공용 DB 기준 합계 2,554개. 백테스트 입력은 migration 007에서 생성하고 012에서 재작성하는 `mart.common_stock_feature_frame_asof`. |
+| 서버 이관 시 필요한 것 | `migrations/*.sql` 전부(001~016)를 파일명 순서대로 적용 후 data dump/restore. mart view는 데이터가 아니라 migration으로 재생성. |
 
 ## 8. 향후 보강하면 좋은 항목
 
 | 우선순위 | 보강 항목 | 이유 |
 |---|---|---|
-| 높음 | `migrations/007_common_stock_mart_views.sql` SQL 작성/적용 | 파일은 존재하지만 현재 내용이 비어 있음. `mart.common_stock_feature_frame_asof`, `mart.common_stock_universe_asof`를 실제 DB에 생성해야 MVP 보통주 백테스트 입력 고정 가능. |
 | 높음 | SEIBro raw → `feature.seibro_report_summary` 변환 job 추가 | raw 10년치는 있지만 feature/mart SEIBro 계층은 후속 변환 필요. |
 | 중간 | BOK/DART 증분 운영 표준화 | BOK `rate-fx`, BOK 월별 유가(`902Y003:010101`, `902Y003:010102`, `902Y003:010103`), DART CFS 장기 백필은 완료. 이후에는 신규 월/분기 데이터 증분 수집, 실제 발표일 부재 series의 보수적 as-of lag 정책, 실패 run 정리와 서버/로컬 동일 검증 자동화가 필요하다. |
 | 중간 | mart view별 권장 사용처 문서화 | 백테스트 입력 혼동 방지. `kis_adjusted_feature_frame_asof`와 common-stock view 구분 필요. |
@@ -522,7 +529,7 @@ python scripts/backfill_seibro_analyst_reports.py `
 | mart feature frame 재작성 | `migrations/004_mart_symbol_metadata.sql:41-83` |
 | security type 분류와 common-stock universe helper | `migrations/006_symbol_security_type_classification.sql:3-103` |
 | KOSPI/KOSDAQ 상장 보통주 2,554개 현황 | `docs/public_server_db_tables.md:90`, `docs/public_server_db_tables.md:574` |
-| 보통주 전용 mart view 정의 대상 | `docs/public_server_db_tables.md:402-470`, `migrations/007_common_stock_mart_views.sql` |
+| 보통주 전용 mart view 정의 | `migrations/007_common_stock_mart_views.sql`, `migrations/012_symbol_sector_metadata.sql` |
 | OHLCV CLI와 service 연결 | `scripts/ingest_ohlcv.py:22`, `scripts/ingest_ohlcv.py:53` |
 | OHLCV chunk 수집, raw 저장, core upsert, 품질 검사 | `quant_agent/data/ingestion.py:39-82`, `quant_agent/data/repository.py:154-358`, `quant_agent/data/repository.py:624` |
 | KIS 수정주가 flag/window/병렬/resume/row 변환 | `scripts/ingest_kis_adjusted_ohlcv.py:3-46`, `scripts/ingest_kis_adjusted_ohlcv.py:223-236`, `scripts/ingest_kis_adjusted_ohlcv.py:548-804` |

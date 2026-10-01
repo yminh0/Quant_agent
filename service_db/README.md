@@ -24,17 +24,32 @@ service_db/
 │   ├── 014_create_report_email_tables.sql
 │   ├── 015_ai_backtest_execution_process_identity.sql
 │   ├── 016_ai_backtest_idempotency.sql
+│   ├── 017_add_notification_settings_to_users.sql
+│   ├── 018_create_email_delivery_outbox.sql
+│   ├── 019_ai_prompt_response_summary.sql
+│   ├── 020_ai_account_tokens.sql
+│   ├── 021_ai_analysis_jobs.sql
 │   ├── 022_immutable_analysis_results.sql
 │   ├── 023_archive_undecodable_analysis_jobs.sql
-│   └── 024_parse_bound_analysis_job_admission.sql
+│   ├── 024_parse_bound_analysis_job_admission.sql
+│   ├── 025_exploration_policy_v2.sql
+│   ├── 026_reseal_exploration_policy_v2.sql
+│   └── 027_reseal_exploration_policy_v2_demotion.sql
 ├── rollbacks/
 │   └── 022_immutable_analysis_results.down.sql
 ├── scripts/
-│   └── apply_migrations.ps1
+│   ├── apply_migrations.ps1
+│   ├── benchmark_recovery_objective.py
+│   ├── run_fixed_migration_replay.py
+│   └── verify_fixed_migration_replay.py
 ├── tests/
+│   ├── test_analysis_result_migration.py
+│   ├── test_migration_restore_drill.py
+│   ├── test_recovery_objective_benchmark.py
 │   └── test_sql_migration.py
 └── docs/
     ├── backtest_result_mapping.md
+    ├── recovery-objectives.md
     ├── report_email_storage.md
     └── service_db_erd.md
 ```
@@ -70,6 +85,16 @@ service_db/
 
 동일한 AI 백테스트 요청의 중복 실행을 차단하고 실행 결과가 불명확한 요청을 안전하게 격리하기 위한 요청 lease와 대체 실행 승인 정보를 저장한다.
 
+### `017`~`021`
+
+| 파일 | 내용 |
+|---|---|
+| `017_add_notification_settings_to_users.sql` | 사용자 알림 설정을 `app.users`에 저장한다(기존 `app.user_notification_settings` 데이터는 이전하지 않음). |
+| `018_create_email_delivery_outbox.sql` | 비동기 이메일 발송 큐 상태. 완료된 발송 결과는 계속 `app.email_delivery_history`에 저장한다. |
+| `019_ai_prompt_response_summary.sql` | `app.ai_prompt_log`에 `assistant_response_summary` 컬럼 추가. |
+| `020_ai_account_tokens.sql` | 요청 quota를 가진 계정별 API 토큰. |
+| `021_ai_analysis_jobs.sql` | AI job의 영속 상태. 공개 job envelope 전체를 JSONB 문서 하나로 저장한다. |
+
 ### `022_immutable_analysis_results.sql`
 
 owner별 canonical rule/data/execution/report manifest를 `app.analysis_result`에 immutable snapshot으로 저장한다. 동일 owner와 동일 manifest hash는 하나의 `analysis_result_id`를 재사용하며, AI job·backtest run·AI report·전략 report가 같은 FK를 참조한다. public snapshot은 허용된 report projection만 저장하고 내부 provenance는 노출하지 않는다.
@@ -82,6 +107,14 @@ rollback은 `rollbacks/022_immutable_analysis_results.down.sql`을 사용하며,
 idempotency key와 durable dispatch outbox를 함께 저장한다. raw prompt나 parse token은
 저장하지 않는다. Job·idempotency·outbox의 생성과 nonce 소비는 하나의 transaction으로
 처리되어 재시작 뒤에도 queued Job을 안전하게 dispatch할 수 있다.
+
+### `023_archive_undecodable_analysis_jobs.sql`
+
+현재 빌드가 더 이상 읽을 수 없는(디코딩 불가) analysis job 행을 보관 처리하고, 이후 그런 행이 다시 들어오지 못하게 막는다. 실제 PostgreSQL에 적용해야만 검증되는 테스트가 있다([`docs/OPERATIONS.md`](../docs/OPERATIONS.md#sql-마이그레이션-테스트)).
+
+### `025`~`027`
+
+`025_exploration_policy_v2.sql`은 PostgreSQL이 소유하는 exploration policy와 영속 비동기 research appendix를 추가한다. `026`, `027`은 전략 blueprint 카탈로그 변경(펀더멘털 행 추가, 10개 행 강등)에 맞춰 KRX exploration policy를 다시 봉인한다.
 
 ## 공용 서버 적용 상태
 

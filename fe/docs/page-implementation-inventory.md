@@ -14,7 +14,7 @@
 | 마이페이지/알림 설정 | 반영 | `src/pages/ProfilePage.tsx`, `src/api/preferencesClient.ts` |
 | `/reports` 세부 설정 | 반영 | `src/pages/ReportsPage.tsx`, `src/features/reports/ReportList.tsx`, `src/features/reports/reportFilters.ts` |
 | 리포트 내보내기/공유/재발송 | 반영 | `src/api/reportActionsClient.ts`, `src/pages/ReportDetailPage.tsx`, `src/features/reports/ReportList.tsx` |
-| 전략 관리 | 반영 | `src/pages/StrategyFormPage.tsx`, `src/api/strategyClient.ts` |
+| 전략 관리 | 반영 후 제거 (현재 코드에 `StrategyFormPage.tsx`, `strategyClient.ts`, `/app/strategies/*` 라우트 없음) | ~~`src/pages/StrategyFormPage.tsx`, `src/api/strategyClient.ts`~~ |
 | 전역 검색 | 반영 | `src/pages/SearchPage.tsx`, `src/components/layout/TopBar.tsx` |
 | 정책/수신거부 | 반영 | `src/pages/LegalPage.tsx`, `src/pages/UnsubscribePage.tsx`, `src/components/layout/Footer.tsx` |
 | 성과 탭 세부 동작 | 반영 | `src/features/app/PerformanceTab.tsx`, `src/features/app/PerformanceChart.tsx` |

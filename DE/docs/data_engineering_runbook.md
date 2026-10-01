@@ -40,7 +40,7 @@ WICS 과거 백테스트를 10년 범위로 수행하려면 해당 기간의 스
 | BOK | `BOK_API_KEY`, 선택: `BOK_BASE_URL` |
 | OpenDART | `FSS_API_KEY`, `FSS_API_KEY_2`, `FSS_API_KEY_3` 권장. 기존 호환용으로 `DART_API_KEY`, `OPENDART_API_KEY`도 인식 |
 | WICS | `WICS_COMPANY_INFO_URL`, 선택: `WICS_REQUEST_WORKERS` |
-| Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `QUANT_AIRFLOW_DAILY_SCHEDULE` |
+| Airflow | `BOK_API_KEY`, `BOK_SERIES_JSON` 또는 `BOK_DAILY_SERIES_JSON`, `DART_REFRESH_CORP_CODES`, `DART_DAILY_PERIOD_MODE`, `OHLCV_SYMBOLS`, `QUANT_TA_MAX_WORKERS`, `QUANT_AIRFLOW_RETRIES`, `QUANT_AIRFLOW_PYTHON`, `QUANT_AIRFLOW_START_DATE`, `QUANT_AIRFLOW_WICS_SCHEDULE`, `QUANT_AIRFLOW_BACKFILL_SCHEDULE`, `QUANT_AIRFLOW_TA_WARMUP_DAYS`, `QUANT_AIRFLOW_EXTERNAL_LOOKBACK_DAYS`, `QUANT_AIRFLOW_OHLCV_REPAIR_LOOKBACK_DAYS`, `QUANT_AIRFLOW_TRADING_CALENDAR_LOOKBACK_DAYS`. 일일·보정·프롬프트 보존 DAG의 스케줄은 코드에 고정되어 있어 환경변수로 바꿀 수 없다. |
 
 공용 DB 정보를 서버에 넣을 때는 아래 위치 중 하나를 쓰면 된다.
 
@@ -157,11 +157,12 @@ wrapper 내부 검증은 KIS 적재 후 `failed_windows`가 비어 있을 때만
 
 `DE/airflow/dags/quant_agent_data_engineering.py`는 다음 DAG를 제공한다. 일일 DAG는 실행일 전일을 기준으로 KRX 거래일 증거·OHLCV·수정주가·TA·외부 데이터·QA를 처리하고, WICS는 별도 주기 DAG에서 현재 스냅샷을 이력으로 저장한다.
 
-| DAG | 역할 |
-|---|---|
-| `quant_agent_daily_data_engineering` | 일일 OHLCV, TA-Lib, BOK, DART corp code refresh |
-| `quant_agent_backfill_ohlcv_10y` | 설정된 primary source 기준 10년 OHLCV backfill |
-| `quant_agent_ohlcv_repair` | 최근 KRX 지연·정정 데이터 재수집 |
-| `quant_agent_wics_sector_snapshot` | KIND 메타데이터와 FnGuide WICS 기간 스냅샷 |
+| DAG | 스케줄 (Asia/Seoul) | 역할 |
+|---|---|---|
+| `quant_agent_daily_data_engineering` | 매일 10:00 | KRX 거래일 증거, 일일 OHLCV, 종목 메타데이터, KIS 수정주가, TA-Lib, BOK, DART 재무(corp code 갱신 포함), QA |
+| `quant_agent_ohlcv_repair` | 매일 07:00 | 최근 7일 KRX 지연·정정 데이터 재수집 → 메타데이터 → QA |
+| `quant_agent_wics_sector_snapshot` | 매주 월 06:00 | KIND 메타데이터와 FnGuide WICS 기간 스냅샷 |
+| `quant_agent_ai_prompt_retention` | 매일 05:00 | 90일 지난 AI prompt/response 내용 삭제 |
+| `quant_agent_backfill_ohlcv_10y` | 없음(수동) | 설정된 primary source 기준 10년 OHLCV backfill |
 
 Airflow task는 credentials를 코드/파일에서 읽지 않고 런타임 환경, Airflow Connection, Secret Backend에 의존한다. WICS 섹터 수집은 `quant_agent_wics_sector_snapshot`에서 주기 실행하며, 수동 스크립트도 같은 이력 테이블을 사용한다. KIS TA/품질 스크립트는 DB 정보가 주입되면 `psycopg`를 자동 선택하고, 그렇지 않으면 로컬 Docker DB 경로를 따른다.

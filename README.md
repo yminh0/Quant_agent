@@ -91,7 +91,7 @@ cd fe && npm install && npm run dev
 | [`ai/`](ai) | 분석 API와 파이프라인 (`ai_graph`) |
 | [`backtest_module/`](backtest_module) | 백테스트 엔진 |
 | [`backend/`](backend) | Google OAuth·세션, 리포트 이메일, 시세 티커 |
-| [`DE/`](DE) · [`airflow/`](airflow) | OHLCV·지표·유니버스 적재와 데이터 마이그레이션 |
+| [`DE/`](DE) · [`DE/airflow/`](DE/airflow) | OHLCV·지표·유니버스 적재와 데이터 마이그레이션 |
 | [`service_db/`](service_db) | 서비스 DB 마이그레이션 (job·정책·감사) |
 | [`scripts/`](scripts) · [`.github/workflows/`](.github/workflows) | 배포 게이트, CI, 서버 헬스체크 |
 

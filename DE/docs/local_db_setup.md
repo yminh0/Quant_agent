@@ -46,11 +46,12 @@ docker compose ps db
 .\scripts\apply_migrations.ps1
 ```
 
-동일 작업을 직접 실행하려면:
+동일 작업을 직접 실행하려면 `migrations/*.sql`(001~016)을 파일명 순서대로 모두 적용한다:
 
 ```powershell
-docker compose exec -T db psql -v ON_ERROR_STOP=1 -U $env:QUANT_DB_USER -d $env:QUANT_DB_NAME -f /migrations/001_data_engineering_m0.sql
-docker compose exec -T db psql -v ON_ERROR_STOP=1 -U $env:QUANT_DB_USER -d $env:QUANT_DB_NAME -f /migrations/002_data_engineering_runtime.sql
+Get-ChildItem migrations -Filter *.sql | Sort-Object Name | ForEach-Object {
+  docker compose exec -T db psql -v ON_ERROR_STOP=1 -U $env:QUANT_DB_USER -d $env:QUANT_DB_NAME -f "/migrations/$($_.Name)"
+}
 ```
 
 ## 4. 접속 문자열

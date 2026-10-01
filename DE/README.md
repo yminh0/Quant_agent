@@ -148,24 +148,39 @@ TA 지표는 `feature.ta_indicator_definition`의 **계산 가능 카탈로그 1
 `migrations/`는 **데이터 자체가 아니라 DB 구조를 만드는 파일**입니다. 새 서버나 로컬 DB를 만들 때는 파일명 순서대로 적용해야 의존성이 맞습니다.
 
 ```text
-001 기본 스키마/테이블 뼈대
+001 기본 스키마/테이블 뼈대 (raw.analyst_report_summary 포함)
   └─ 002 런타임 mart view와 DART 보조 매핑
       └─ 003 KIS 수정주가 + ticker TA + QA/관측성/lineage 확장
           └─ 004 종목 lifecycle 메타데이터 + mart view 재작성
-              └─ 005 SEIBro 분석리포트 raw landing 보장
-                  └─ 006 security_type 분류 + 보통주 universe view
+              └─ 006 security_type 분류 + 보통주 universe view
+                  └─ 007 보통주 as-of mart view
+                      └─ 008~010 한경 컨센서스 PDF 임시 landing
+                          └─ 012 섹터 메타데이터
+                              └─ 013 KRX 공식 TR 벤치마크 · PIT universe membership
+                                  └─ 014 backtest readiness (availability · WICS 이력 · DART filing 버전)
+                                      └─ 015 KRX 지수 구성종목 이력
+                                          └─ 016 lineage event 멱등성
 ```
 
-| 순서 | 파일 | 목적 | 왜 이 순서인가 |
-|---:|---|---|---|
-| 1 | `001_data_engineering_m0.sql` | TimescaleDB extension, `meta/raw/core/feature/mart` 스키마, 기본 테이블과 초기 mart view 생성 | 모든 후속 migration이 참조하는 최상위 뼈대 |
-| 2 | `002_data_engineering_runtime.sql` | DART corp-code 매핑, `mart.symbol_feature_frame_asof`, BOK/DART as-of view, 읽기 role 추가 | 001의 core/feature 테이블이 있어야 view 생성 가능 |
-| 3 | `003_quality_observability_lineage.sql` | `feature.adjusted_ohlcv_daily`, ticker 기반 TA 테이블, KIS adjusted mart view, API request log/lineage metadata 확장 | Phase 2의 수정주가·TA·관측성 핵심 구조 |
-| 4 | `004_mart_symbol_metadata.sql` | `core.symbol_master`에 시장/상장상태/상장일/상폐일/metadata 보강, mart view를 수정주가+TA 기준으로 재작성 | 003의 adjusted/TA 테이블을 기준으로 최종 조회 view를 다시 묶음 |
-| 5 | `005_seibro_analyst_report_summary.sql` | `raw.analyst_report_summary` landing table과 인덱스 보장 | SEIBro 크롤링 결과를 idempotent하게 적재 |
-| 6 | `006_symbol_security_type_classification.sql` | 보통주/우선주/SPAC/ETF/ETN/리츠 등 `security_type` 분류 함수와 `meta.view_common_stock_universe` 생성 | 004에서 보강된 시장/상장 메타를 활용해 최종 universe filter 생성 |
+| 순서 | 파일 | 목적 |
+|---:|---|---|
+| 1 | `001_data_engineering_m0.sql` | TimescaleDB extension, `meta/raw/core/feature/mart` 스키마, 기본 테이블(`raw.analyst_report_summary` 포함)과 초기 mart view 생성 |
+| 2 | `002_data_engineering_runtime.sql` | DART corp-code 매핑, `mart.symbol_feature_frame_asof`, BOK/DART as-of view, 읽기 role 추가 |
+| 3 | `003_quality_observability_lineage.sql` | `feature.adjusted_ohlcv_daily`, ticker 기반 TA 테이블, KIS adjusted mart view, API request log/lineage metadata 확장 |
+| 4 | `004_mart_symbol_metadata.sql` | `core.symbol_master`에 시장/상장상태/상장일/상폐일/metadata 보강, mart view를 수정주가+TA 기준으로 재작성 |
+| 5 | `006_symbol_security_type_classification.sql` | 보통주/우선주/SPAC/ETF/ETN/리츠 등 `security_type` 분류 함수와 `meta.view_common_stock_universe` 생성 |
+| 6 | `007_common_stock_mart_views.sql` | KRX 세션과 lifecycle 구간 기반 `mart.common_stock_universe_asof` |
+| 7 | `008`~`010_hankyung_consensus_pdf_temp*.sql` | 한경 컨센서스 PDF 추출 임시 landing 테이블, 메타데이터, crawler seed |
+| 8 | `012_symbol_sector_metadata.sql` | 상장사 섹터 스냅샷 컬럼 |
+| 9 | `013_krx_official_benchmark_tr.sql` | 자동 전략 수용 기준용 KOSPI/KOSDAQ 공식 총수익(TR) 벤치마크 입력 |
+| 10 | `013_point_in_time_universe_membership.sql` | 백테스트용 mart view의 PIT universe membership |
+| 11 | `014_backtest_readiness.sql` | 명시적 availability, WICS 이력, DART filing 버전 |
+| 12 | `015_krx_index_membership_history.sql` | KOSPI200/KOSDAQ150 구성종목 PIT 구간 |
+| 13 | `016_lineage_event_idempotency.sql` | lineage upsert용 유니크 인덱스(`CONCURRENTLY`, 트랜잭션 밖에서 적용, 기존 중복 행 정리 후) |
 
-> 실무 적용 원칙: 서버 이관 시에는 일부만 고르기보다 **001 → 006을 순서대로 전부 적용**한 뒤 dump/restore 또는 수집 스크립트로 데이터를 채우는 방식을 권장합니다.
+`005`, `011` 번호는 비어 있습니다. `013`은 파일이 두 개이며 파일명 순서대로 적용됩니다.
+
+> 실무 적용 원칙: 서버 이관 시에는 일부만 고르기보다 **`migrations/*.sql`을 파일명 순서대로 전부 적용**한 뒤 dump/restore 또는 수집 스크립트로 데이터를 채우는 방식을 권장합니다.
 
 ---
 
@@ -264,7 +279,7 @@ $env:QUANT_DB_NAME = "quant_agent"
 $env:QUANT_DB_USER = "quant_agent"
 $env:QUANT_DB_PORT = "5432"
 
-# 2) DB 시작 + migrations/*.sql 순차 적용(014 포함)
+# 2) DB 시작 + migrations/*.sql 순차 적용
 .\scripts\apply_migrations.ps1
 ```
 
@@ -272,7 +287,7 @@ $env:QUANT_DB_PORT = "5432"
 
 1. `docker compose up -d db`
 2. PostgreSQL readiness 확인
-3. `migrations/*.sql`을 파일명 순서대로 `psql -v ON_ERROR_STOP=1`로 적용. 운영 DB의 기존 스키마가 013까지 적용되어 있어야 하며, 014는 WICS 이력·명시적 availability·DART filing 버전을 추가합니다.
+3. `migrations/*.sql`을 파일명 순서대로 `psql -v ON_ERROR_STOP=1`로 적용. 014는 WICS 이력·명시적 availability·DART filing 버전을 추가하고, 016은 기존 중복 lineage 행을 정리한 뒤에 적용해야 합니다.
 
 DB 컨테이너 기본값:
 
@@ -291,6 +306,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+> `requirements.txt`는 루트 `.gitignore` 대상이라 저장소에 포함되어 있지 않습니다. 새로 clone한 환경에서는 별도로 준비해야 합니다(`Dockerfile`도 이 파일을 사용합니다).
 
 ### 5.4 데이터 수집/계산 스크립트
 
@@ -312,24 +329,28 @@ python -m venv .venv
 
 ### 5.5 Airflow DAG
 
-Airflow 환경에서는 `DE/airflow/dags/quant_agent_data_engineering.py`가 일일 파이프라인을 정의합니다.
+Airflow 환경에서는 `DE/airflow/dags/quant_agent_data_engineering.py`가 아래 DAG를 정의합니다. 모든 스케줄은 Asia/Seoul 기준이며, 실패 시 기본 3회(`QUANT_AIRFLOW_RETRIES`) 재시도합니다.
+
+| DAG | 스케줄 | 내용 |
+|---|---|---|
+| `quant_agent_daily_data_engineering` | 매일 10:00 (`0 10 * * *`) | 일일 수집·계산·QA |
+| `quant_agent_ohlcv_repair` | 매일 07:00 (`0 7 * * *`) | 늦게 공개·정정된 KRX 세션을 위해 최근 7일 OHLCV 재수집 → 메타데이터 → QA |
+| `quant_agent_wics_sector_snapshot` | 매주 월 06:00 (`0 6 * * 1`, `QUANT_AIRFLOW_WICS_SCHEDULE`로 변경) | KIND 섹터 메타데이터 → FnGuide WICS 이력 스냅샷 |
+| `quant_agent_ai_prompt_retention` | 매일 05:00 (`0 5 * * *`) | 90일 지난 AI prompt/response 내용 삭제 |
+| `quant_agent_backfill_ohlcv_10y` | 기본 없음(수동, `QUANT_AIRFLOW_BACKFILL_SCHEDULE`로 지정) | 10년 OHLCV 백필 |
+
+일일 DAG의 task 의존성:
 
 ```text
 refresh_krx_trading_calendar_daily
   → ingest_ohlcv_daily
-      ├─ refresh_symbol_metadata_daily
+      ├─ refresh_symbol_metadata_daily → ingest_dart_financials_daily
       ├─ ingest_kis_adjusted_ohlcv_daily → compute_ta_indicators_daily
-      ├─ ingest_bok_daily
-      └─ ingest_seibro_reports_daily
-          → run_data_quality_checks_daily
-
-quant_agent_wics_sector_snapshot  # 주간 KIND 메타데이터 + FnGuide WICS 이력
-repair_krx_trading_calendar       # 거래일 증거 보정/재수집
-
-ingest_dart_corp_codes_daily  # 독립 실행
+      └─ ingest_bok_daily
+          → run_data_quality_checks_daily  (symbol_metadata · dart · TA · bok 완료 후)
 ```
 
-일일 실행은 거래일 캘린더에 아직 기록되지 않은 직전 날짜를 대상으로 하며, 주말·공휴일은 원천 응답이 없어도 휴장으로 확정하지 않습니다. 평일 무응답은 `unconfirmed`로 남겨 지연 공개와 실제 휴장을 구분합니다. 백테스트는 KRX 거래일 증거와 각 매크로/DART `available_from`을 함께 필터링해야 합니다.
+일일 실행은 실행일(KST)의 직전 날짜를 대상으로 합니다. OHLCV는 이미 적재된 마지막 KRX 거래일 다음 날부터 대상일까지를 수집하고, 주말·공휴일은 빈 요청으로 지나갑니다. `BOK_API_KEY`가 없으면 BOK task는 skip됩니다. 백테스트는 KRX 거래일 증거와 각 매크로/DART `available_from`을 함께 필터링해야 합니다.
 
 ### 5.6 바로 조회해 보기
 
@@ -386,7 +407,7 @@ LIMIT 20;
 
 | 체크 | 확인 쿼리/위치 |
 |---|---|
-| DB schema가 최신인가 | `migrations/001` → `006` 적용 여부 |
+| DB schema가 최신인가 | `migrations/001` → `016` 적용 여부 |
 | 최근 수집 run이 성공했는가 | `meta.ingestion_run` |
 | KIS API 장애/지연이 있는가 | `meta.api_request_log` |
 | 품질 이슈가 남아 있는가 | `meta.data_quality_issue` |

@@ -5,8 +5,8 @@
 | 파일 | 목적 | 실행 주기/방식 |
 |---|---|---|
 | `scripts/ingest_dart_bok_history.py` | OpenDART 재무제표와 BOK ECOS 매크로 시계열을 기존 PostgreSQL feature 테이블에 스키마 스캔 후 적재 | 수동 1달 테스트, 10년 백필, Airflow 일일 실행. BOK `rate-fx` 12개 series, 월별 유가 3개 series(WTI/Dubai/Brent), DART CFS 재무제표 2016~2026 period_end 구간은 적재 완료. |
-| `DE/airflow/dags/quant_agent_data_engineering.py` | 거래일 증거, OHLCV, KIS 수정주가, TA, DQ, BOK, DART 일일 자동 수집 및 WICS 주기 스냅샷 DAG | 일일 기본 cron `0 10 * * *`, WICS 기본 cron `0 6 * * 1` |
-| `scripts/ingest_ohlcv.py` | KRX 등 원천 OHLCV 적재 | DAG `ingest_ohlcv_daily` |
+| `DE/airflow/dags/quant_agent_data_engineering.py` | 거래일 증거, OHLCV, KIS 수정주가, TA, DQ, BOK, DART 일일 자동 수집, OHLCV 보정, WICS 주기 스냅샷, AI 프롬프트 보존 정리 DAG | 일일 `0 10 * * *`, OHLCV 보정 `0 7 * * *`, WICS 기본 `0 6 * * 1`, 프롬프트 보존 `0 5 * * *` (모두 Asia/Seoul) |
+| `scripts/ingest_ohlcv.py` | KRX 등 원천 OHLCV 적재 | 수동 실행. DAG의 `ingest_ohlcv_daily`는 같은 `OhlcvIngestionService`를 직접 호출 |
 | `scripts/ingest_kis_adjusted_ohlcv.py` | KIS 공식 수정주가 OHLCV 적재 | DAG `ingest_kis_adjusted_ohlcv_daily` |
 | `scripts/compute_technical_indicators_pipeline.py` | 수정주가 기반 TA 지표 계산 | DAG `compute_ta_indicators_daily` |
 | `scripts/refresh_symbol_metadata.py` | 종목 메타데이터/분류 갱신 | DAG `refresh_symbol_metadata_daily` |
@@ -128,7 +128,7 @@ DART 수집은 `feature.dart_financial_quarterly`를 호환용 최신 행으로 
 | 항목 | 값/동작 |
 |---|---|
 | DAG ID | `quant_agent_daily_data_engineering` |
-| 기본 스케줄 | `0 10 * * *` (다음 영업일 오전 10시 실행, 직전 영업일 기준 적재) |
+| 기본 스케줄 | `0 10 * * *` (Asia/Seoul, 주말 포함 매일 오전 10시 실행, 실행일의 직전 날짜 기준 적재. 휴장일은 빈 요청으로 지나감) |
 | 재시도 | `QUANT_AIRFLOW_RETRIES` 기본값 `3` |
 | retry delay | 5분 |
 | 환경변수 주입 | 런타임 환경변수, Airflow Connection 또는 Secret Backend에서 주입한다. DAG와 스크립트는 `.env` 파일을 읽지 않는다. |
@@ -151,11 +151,12 @@ DART 수집은 `feature.dart_financial_quarterly`를 호환용 최신 행으로 
 ### 의존성
 
 ```text
-ingest_ohlcv_daily
-  ├─ refresh_symbol_metadata_daily ─┬─ run_data_quality_checks_daily
-  │                                  └─ ingest_dart_financials_daily
-  ├─ ingest_kis_adjusted_ohlcv_daily → compute_ta_indicators_daily → run_data_quality_checks_daily
-  ├─ ingest_bok_daily
+refresh_krx_trading_calendar_daily
+  → ingest_ohlcv_daily
+      ├─ refresh_symbol_metadata_daily ─┬─ run_data_quality_checks_daily
+      │                                  └─ ingest_dart_financials_daily → run_data_quality_checks_daily
+      ├─ ingest_kis_adjusted_ohlcv_daily → compute_ta_indicators_daily → run_data_quality_checks_daily
+      └─ ingest_bok_daily → run_data_quality_checks_daily
 ```
 
 ## 3. 운영자가 팀에 설명할 핵심 포인트

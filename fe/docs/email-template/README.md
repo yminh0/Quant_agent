@@ -10,7 +10,7 @@ FE가 만든 이메일 HTML 템플릿과 그 렌더 결과물이다. 발송 요�
 | `fe/src/features/reports/DailyDigestEmail.tsx` | `<DailyDigestEmail digest baseUrl />` 컴포넌트 + `renderDailyDigestEmailHtml(props)`. 나머지 FE와 같은 React/TSX이고, 발송용 HTML 문자열은 `renderToStaticMarkup`으로 뽑는다. |
 | `fe/docs/email-template/daily-digest.sample.html` | 위 컴포넌트 + `dailyDigest.mock.ts`로 생성한 실제 이메일 HTML. 브라우저나 메일 클라이언트로 바로 열어보면 된다. |
 | `fe/scripts/generate-daily-digest-email.mjs` | 샘플 재생성 스크립트. |
-| `/dev/email-template` | 예비 라우트. 로그인 없이 열리고, iframe 미리보기 + HTML 복사/다운로드 + 구성안 대조표를 보여준다. |
+| ~~`/dev/email-template`~~ | 제품 번들에서 제거된 개발용 라우트. 미리보기는 `daily-digest.sample.html`을 직접 연다. |
 
 샘플 재생성:
 
