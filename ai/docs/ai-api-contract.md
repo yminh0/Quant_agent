@@ -24,25 +24,33 @@ actual DSN value.
 
 ## Browser FE Integration
 
-Set `AI_CORS_ALLOW_ORIGINS` on the AI API process to a comma-separated list of
-allowed FE origins. The FastAPI adapter enables credentialed CORS only when this
-environment variable is present. The FE points to this API with
-`VITE_AI_API_BASE_URL` and calls `/analysis-jobs` directly.
+The FE reaches the AI API through a same-origin `/ai-api` proxy (Vite in dev,
+`fe/scripts/production-gateway.mjs` in deployment, where the AI app is mounted at
+`/ai-api` inside `combined_main.py`). CORS is only needed when a browser calls the
+AI API directly: set `AI_CORS_ALLOW_ORIGINS` on the AI API process to a
+comma-separated list of allowed origins. The FastAPI adapter enables credentialed
+CORS only when this environment variable is present. Production builds may
+override the base URL with `VITE_AI_API_BASE_URL`.
 
 ## Data Sources
 
-When `AI_DATABASE_DSN` is set, the AI pipeline loads production data from the
-common PostgreSQL/TimescaleDB objects below:
+When a database DSN is set (`AI_DATABASE_DSN`, `QUANT_DB_DSN`, or `DATABASE_URL`,
+in that order), the AI pipeline loads data from the common PostgreSQL/TimescaleDB
+objects below:
 
-| Pipeline input | DB object | Status in DE inventory |
-|---|---|---|
-| Backtest OHLCV/TA rows | `mart.kis_adjusted_feature_frame_asof` | 10-year KIS adjusted feature frame available |
-| Tradable universe lookup | `meta.view_common_stock_universe` | common-stock helper view available |
-| L4 analyst evidence | `raw.analyst_report_summary` | 10-year SEIBro raw rows available |
+| Pipeline input | DB object |
+|---|---|
+| Backtest OHLCV rows | `feature.kis_adjusted_ohlcv_daily`, `core.ohlcv_daily` (raw execution prices) |
+| Technical indicators | `feature.ta_trend_ticker_daily`, `feature.ta_momentum_ticker_daily`, `feature.ta_volatility_ticker_daily`, `feature.ta_volume_ticker_daily` |
+| Tradable universe lookup | `meta.view_common_stock_universe`, `core.symbol_master`, `core.symbol_security_type_history`, `core.trading_calendar` |
+| Index universes | `feature.krx_index_membership_history` |
+| Sector | `feature.wics_symbol_sector_history` |
+| Fundamentals (PER) | `mart.dart_financial_asof` |
+| Macro snapshot for risk rules | `mart.bok_macro_asof` |
+| L4 analyst evidence | `raw.analyst_report_summary` |
 
-`mart.bok_macro_asof`, `mart.dart_financial_asof`, and `mart.seibro_universe_asof`
-are not treated as production-grade AI inputs yet because the inventory marks
-them as pilot-only or empty.
+If the DSN is set and a query fails, the job fails; it never falls back to
+fixtures. Release profiles refuse fixture analysis entirely.
 
 ## LLM Provider
 
@@ -52,15 +60,13 @@ set:
 | Env | Purpose |
 |---|---|
 | `AI_LLM_PROVIDER=mock|aoai` | provider selector |
-| `AI_AOAI_RESPONSES_URL` | Azure OpenAI Responses preview REST URL |
+| `AI_AOAI_RESPONSES_URL` | Azure OpenAI Responses REST URL (`/openai/v1/responses` or the preview path) |
 | `AI_AOAI_API_KEY` | secret API key; never store in code, fixtures, snapshots, or logs |
 | `AI_AOAI_MODEL` | deployment or model name |
 
-The current implementation intentionally uses a thin `httpx` client because the
-configured endpoint is the Azure preview REST path:
-`/openai/responses?api-version=2025-04-01-preview`. If the deployment later
-moves to an `/openai/v1/responses`-compatible surface, this client can be
-replaced by an SDK-backed implementation behind the same `LLMClient` interface.
+The implementation uses a thin `httpx` client. It accepts both the
+`/openai/v1/responses` surface (web search tool type `web_search`) and the preview
+path (`web_search_preview`); `AI_AOAI_WEB_SEARCH_TOOL_TYPE` overrides the choice.
 
 ## Canonical backtest surface
 
@@ -86,6 +92,10 @@ replaced by an SDK-backed implementation behind the same `LLMClient` interface.
   "query": "RSI가 30 이하로 떨어진 KOSPI200 종목을 사고, 70 이상이면 팔고 싶어"
 }
 ```
+
+The request is queued and the endpoint returns `201` with the `queued` job at once;
+the graph runs as a background task. Poll `GET /analysis-jobs/{job_id}` or stream
+`GET /analysis-jobs/{job_id}/events` for progress and the final result.
 
 `GET /analysis-jobs/{job_id}`
 

@@ -86,8 +86,8 @@ AI_L4_EVIDENCE_LIMIT=5 \
   --app-dir "$WORKTREE_ROOT/ai" --host "$AI_API_HOST" --port "$AI_API_PORT"
 ```
 
-AI 운영 로그는 기본적으로 꺼져 있다. 배포 workflow는 migration 011·013·019를 적용하고,
-서버에서 생성한 signed admission과 `AI_AUDIT_PRODUCTION_ENABLED=1`을 AI process에만
+AI 운영 로그는 기본적으로 꺼져 있다. 배포 workflow는 migration을 실행하지 않고(필요한 schema는
+readiness 검사로 확인한다), 서버에서 생성한 signed admission과 `AI_AUDIT_PRODUCTION_ENABLED=1`을 AI process에만
 주입해 PostgreSQL sink를 명시적으로 켠다. AOAI가 반환한 공개 assistant response 원문은
 `assistant_response`, 구조화 응답의 summary 계열 필드에서 만든 축약본은
 `assistant_response_summary`에 저장한다. provider가 공개하지 않는 내부 reasoning item은
@@ -152,16 +152,15 @@ PY
 | 영역 | 주요 파일 | 계약 |
 |---|---|---|
 | 9-node graph | `ai_graph/graph.py` | Supervisor, Ambiguity, Data, Research, BacktestCode, Backtest, Signal, Risk Manager, Report 순서 |
-| Swagger/API | `ai_graph/api.py` | `/docs`, `/openapi.json`, `/health`, `/api-status`, `/analysis-jobs`, `/api/strategies/parse`, `/api/strategies/descriptions`, `/api/backtests/{strategy_id}`, `/api/reports/{report_id}` |
+| Swagger/API | `ai_graph/api.py` | `/docs`, `/openapi.json`, `/health`, `/readiness`, `/api-status`, `/analysis-jobs`, `/analysis-jobs/{job_id}`, `/analysis-jobs/{job_id}/events`, `/analysis-jobs/{job_id}/cancel`, `/analysis-jobs/{job_id}/research-appendix`, `/api/strategies/parse`, `/api/strategies/descriptions`, `/api/research/jobs`, `/api/research/jobs/{job_id}/result`, `/api/analysis-jobs/{job_id}`, `/api/backtests/{strategy_id}`, `/api/reports/{report_id}`, `/ai/daily-digest` |
 | DB data source | `ai_graph/data_sources/db.py` | `feature.kis_adjusted_ohlcv_daily`, `feature.ta_*_ticker_daily`, `meta.view_common_stock_universe`, `core.symbol_master`(`symbol`/`sector` 섹터 보강), `raw.analyst_report_summary` |
 | LLM provider | `ai_graph/llm/**` | env 기반 `mock`/`aoai` 선택, role별 AOAI deployment override, AOAI Responses JSON parsing |
 | 공통 schema | `ai_graph/schemas.py`, `state.py` | StrategySpec, APIEnvelope, L4 evidence, polling stage, dual output |
 | Job/polling | `ai_graph/jobs.py` | `interpreting`, `code_generation`, `backtest`, `debate`, `finalizing` 상태 |
-| Retrieval | `ai_graph/retrieval/**` | L1 50+ 전략 KB, L2 150+ 지표 KB, Retrieve-then-Smooth 후보 카드 |
 | Code security | `ai_graph/security/ast_validator.py` | allowlist import와 금지 함수/모듈 차단 |
 | Backtest | `ai_graph/nodes/backtest_code.py`, `backtest.py` | Loop3 후보 신호를 `backtest_module` 엔진으로 실행하고 A/B 성과 최고 후보 선택 |
 | Signal | `ai_graph/nodes/signal.py` | BUY/HOLD/DROP, mock 프로필의 결정론 fallback, L4 evidence fixture/SEIBro raw |
-| Risk | `ai_graph/nodes/risk_manager.py` | KOSPI -5%, FX 2%, VKOSPI 30 룰 |
+| Risk | `ai_graph/nodes/risk_manager.py` | KOSPI -5%(유니버스 평균 proxy), FX 2%, VKOSPI 30 룰(입력 시계열이 없어 현재는 평가하지 않음), 포트폴리오 집중도 confidence 감액(최대 33%) |
 | Report | `ai_graph/nodes/report.py` | web_projection과 email_projection 동시 생성, 데이터 가용성/스크리닝 후보 섹션 |
 | API contract | `docs/ai-api-contract.md` | FE/BE envelope와 debug_ref 경계 |
 
@@ -172,7 +171,9 @@ PY
   - `job_store.requested_mode`, `job_store.active_mode`, `job_store.mode_env`,
     `job_store.dsn_configured`, `job_store.fallback`, `job_store.fallback_reason` 확인.
   - DSN/secret 값은 응답 본문에 노출되지 않는다.
-- `POST /analysis-jobs`는 `201`로 `AnalysisJob`을 반환한다.
+- `POST /analysis-jobs`는 job을 큐에 넣고 즉시 `201`로 `AnalysisJob`(`queued`)을 반환한다.
+  그래프는 background task로 실행되며, 클라이언트는 `GET /analysis-jobs/{job_id}` 폴링 또는
+  `/analysis-jobs/{job_id}/events` 스트림으로 완료된 결과를 받는다. 완료된 job의 계약은 다음과 같다.
   - `result.status`는 `ready | need_clarification | rejected | failed`.
   - `result.status == ready`:
     - `stages` 5개(`interpreting`..`finalizing`)가 채워짐.
@@ -186,24 +187,21 @@ PY
 - `GET /analysis-jobs/{job_id}`는 동일 `job_id/trace_id`의 결과를 반환한다.
 
 ## AI_JOB_STORE persistent 별도 게이트
-- 기본 fixture는 `AI_JOB_STORE=memory`.
-- `AI_JOB_STORE=persistent`는 명시적으로 요청 모드만 persistent로 기록하고,
-  저장소/DSN 미구성 상태에서는 `/api-status`에서:
-  - `requested_mode=persistent`
-  - `active_mode=memory`
-  - `fallback=true`
-  - `fallback_reason`에 DSN/adapter 미구성 사유가 남는다.
+- 기본값은 `AI_JOB_STORE=memory`(`BE_JOB_STORE_MODE`도 인식).
+- `AI_JOB_STORE=persistent`이면 AI app이 DSN(`AI_DATABASE_DSN`/`QUANT_DB_DSN`/`DATABASE_URL`)으로
+  `PostgresAnalysisJobRepository`를 조립한다. DSN이나 repository가 없으면 memory로 대체하지 않고
+  `JobStoreConfigurationError`로 기동을 거부한다(fail-closed).
+- `/api-status`의 `job_store.requested_mode`, `active_mode`, `fallback`으로 실제 모드를 확인한다.
 
 ## Mock/Fixture 경계
 | 항목 | 동작 |
 |---|---|
 | `AI_LLM_PROVIDER=mock` | 로컬 결정론 fallback 허용 |
 | `AI_LLM_PROVIDER=aoai` | AOAI Responses env 필수, provider/schema 실패 시 fail-closed |
-| local markdown KB | 운영용 벡터/검색 인덱스 |
 | fixture price rows | 공용 DB `feature.kis_adjusted_ohlcv_daily` + `feature.ta_*_ticker_daily` 기반 가격/TA screening |
 | fixture L4 evidence | `raw.analyst_report_summary` 기반 SEIBro raw evidence |
 | in-memory debug/job store | `AI_JOB_STORE=memory` |
-| persistent gate | `AI_JOB_STORE=persistent`는 `/api-status`에서 requested/active/fallback로 추적 |
+| persistent gate | `AI_JOB_STORE=persistent`는 DSN이 없으면 기동 거부, 모드는 `/api-status`에서 추적 |
 
 ## PIT 유니버스: 1년 창 + 거래대금 상위 100종
 
@@ -215,10 +213,10 @@ Data 노드는 5년치 전체 PIT 보통주(1,717종)를 올렸다. 그 한 건�
 Backtest 노드는 raw 체결가가 없는 bar에서 `raw_execution_unavailable`로 죽었다.
 좁힌 기준은 세 가지다.
 
-- **창 길이**: `AI_BACKTEST_LOOKBACK_YEARS`(기본 1, `1~3` clamp). 마지막 완료 KST
+- **창 길이**: `AI_BACKTEST_LOOKBACK_YEARS`(기본 1, `1~5` clamp). 마지막 완료 KST
   세션이 끝점이고, 길이는 정책 id `krx_pit_common_stock_{N}y_kst_settled_session_v3`에
   실린다. 짧게 읽었다는 사실이 매니페스트에 남지 않으면 재현이 아니라 그냥 다른 실행이다.
-- **유니버스 상한**: `AI_BACKTEST_UNIVERSE_MAX_TICKERS`(기본 200).
+- **유니버스 상한**: `AI_BACKTEST_UNIVERSE_MAX_TICKERS`(기본 100).
   `mart.common_stock_universe_asof`에서 창에 속한 멤버를 모두 후보로 두되,
   **창 시작 시점에서 끝나는 60세션**의 평균 거래대금(`adj_close × adj_volume`)으로
   DB가 순위를 매겨 상위 N종만 적재한다. 랭킹·상한은 SQL 한 문장(CTE)에서 끝나고,
@@ -260,9 +258,8 @@ Backtest 노드는 raw 체결가가 없는 bar에서 `raw_execution_unavailable`
 
 ## Post-MVP 후보(현재 범위 밖)
 
-1. FastAPI adapter의 `InMemoryAnalysisJobStore`를 영속 job store로 교체.
-2. L1/L2 KB를 파일 fixture에서 검색 인덱스로 승격.
-3. OpenDART/BOK/SEIBro feature mart 적재 후 proxy 조건을 실제 재무/거시/컨센서스 필터로 교체.
+1. 운영 기본 job store를 영속 store로 고정 (영속 store 자체는 `AI_JOB_STORE=persistent`로 구현됨).
+2. OpenDART/BOK/SEIBro feature mart 적재 후 proxy 조건을 실제 재무/거시/컨센서스 필터로 교체.
 
 ## 완료된 항목
 

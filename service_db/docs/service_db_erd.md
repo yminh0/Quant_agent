@@ -40,6 +40,17 @@ erDiagram
 | `011_app_ai_backtest_erd.sql` | 사용자, 전략, AI 실행·로그, 백테스트, AI 리포트 |
 | `013_ai_runtime_logging.sql` | 모델 호출과 agent 실행 연결, 응답 메타데이터, prompt retention 인덱스 |
 | `014_create_report_email_tables.sql` | 이메일 리포트, 뉴스, 후보 종목, 구독, 발송 이력, 조회 view |
+| `015_ai_backtest_execution_process_identity.sql` | `app.code_execution_run`의 실행 process identity |
+| `016_ai_backtest_idempotency.sql` | AI 백테스트 요청 lease와 대체 실행 승인 |
+| `017_add_notification_settings_to_users.sql` | `app.users`의 알림 설정 |
+| `018_create_email_delivery_outbox.sql` | 비동기 이메일 발송 outbox |
+| `019_ai_prompt_response_summary.sql` | `app.ai_prompt_log.assistant_response_summary` |
+| `020_ai_account_tokens.sql` | 계정별 API 토큰과 quota |
+| `021_ai_analysis_jobs.sql` | AI analysis job 영속 상태 |
+| `022_immutable_analysis_results.sql` | `app.analysis_result` immutable snapshot |
+| `023_archive_undecodable_analysis_jobs.sql` | 디코딩 불가 analysis job 보관 |
+| `024_parse_bound_analysis_job_admission.sql` | parse nonce·idempotency·dispatch outbox |
+| `025`~`027` | exploration policy와 research appendix, policy 재봉인 |
 
 ## 핵심 추적 관계
 

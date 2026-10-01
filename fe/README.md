@@ -8,11 +8,10 @@ Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScri
 |---|---|
 | `/` | `HI-FI · 07 — / 랜딩` |
 | `/app` | `HI-FI · 08 — /app · 전체 탭`, `HI-FI · 09 — /app · 매매종목 정보 탭`, `HI-FI · 10 — /app · 수익률 탭` |
-| `/app/strategies/new` | 전략 생성 폼 |
-| `/app/strategies/:id/edit` | 전략 수정 폼 |
 | `/login` | Google 로그인 시작 |
 | `/auth/google/callback` | Google OAuth callback 처리 |
 | `/me`, `/me/notifications` | 마이페이지, 리포트 알림 설정 |
+| `/me/email-reports/:id` | 발송된 이메일 리포트 상세 |
 | `/reports` | `HI-FI · 14 — /reports 리포트 목록` |
 | `/reports/:id` | `HI-FI · 11 — /reports/:id 리포트 상세` |
 | `/search` | 전략·종목·리포트 통합 검색 |
@@ -33,9 +32,10 @@ Figma MCP에서 확인한 순수 `HI-FI ·` 프레임 기준의 React + TypeScri
 | Name | Purpose |
 |---|---|
 | `VITE_AI_API_BASE_URL` | production 빌드에서만 적용되는 AI API base URL (`/ai-api`는 dev에서 고정)
+| `VITE_BACKEND_API_BASE_URL` | backend API base URL (기본 `/api/v1`) |
 | `VITE_AUTH_API_BASE_URL` | Google OAuth 시작/콜백/로그아웃 API base URL |
 | `VITE_REPORT_ACTION_API_BASE_URL` | 리포트 이메일 재발송 API base URL |
-| `VITE_STRATEGY_API_BASE_URL` | 전략 저장/분석 실행 API base URL |
+| `VITE_STRATEGY_API_BASE_URL` | 전략 저장/분석 실행 API base URL (기본값은 backend API base URL) |
 
 ## FE 설치
 
@@ -57,7 +57,7 @@ FE_ROOT=$(readlink -f "$WORKTREE_ROOT/fe")
 "$NODE_BIN" "$VITE_ENTRY" "$FE_ROOT" --host 127.0.0.1
 ```
 
-- `fe/vite.config.ts`의 `server.proxy['/ai-api']`는 `http://127.0.0.1:18001`로 전달한다.
+- `fe/vite.config.ts`의 dev server는 `18000` 포트를 쓴다. 기본(split) 모드에서 `/ai-api`는 `/ai-api` prefix를 떼고 `http://127.0.0.1:18001`(`AI_BACKEND_PROXY_TARGET`)로, `/api/v1`은 `http://127.0.0.1:18002`(`BACKEND_PROXY_TARGET`)로 전달한다. `COMBINED_BACKEND_PROXY_TARGET`을 주면 combined 모드가 되어 두 경로를 모두 그 대상(예: `combined_main` :18011)으로 prefix 그대로 전달한다.
 - SSH 포워딩은 `18000` 포트만 허용한다 (`-L 18000:127.0.0.1:18000`).
 - 동일 브라우저 세션을 유지한다. QA 중 page reload/restart는 수행하지 않는다.
 
@@ -99,7 +99,7 @@ console.assert(evidence.origin==="http://127.0.0.1:18000"&&evidence.values.every
 - **빈 상태**: 분석 전 workspace template, 실제 발송 API가 없는 이메일 이력, 실제 history API가 없는 과거 리포트는 빈 상태를 표시한다.
 - **로컬 캐시**: 최신 실제 job 한 건을 `localStorage`에 보관하고 서버 조회가 일시 실패하면 마지막 실제 응답을 표시한다. 이전 `ai-job:<job_id>` 리포트는 서버의 job 조회 API로 다시 가져오며 fixture 결과로 대체하지 않는다.
 - **사용자 격리**: 보호 route 진입 전에 backend `/auth/me`로 Redis session을 검증한다. 로그아웃·사용자 변경 시 분석/대화/알림 캐시를 함께 삭제하고, job 조회의 `401`/`403`/`404`는 캐시 fallback 없이 오류로 처리한다.
-- **동기 요청 한계**: 현재 서버가 graph를 동기 실행하므로 FE는 기본 AOAI timeout/retry의 순차 호출 예산에 맞춰 분석 요청을 최대 20분 기다린다. 비동기 queue 전환은 별도 아키텍처 작업이다.
+- **비동기 job**: 서버는 `POST /analysis-jobs`에서 job을 큐에 넣고 바로 반환하며, FE는 2초 간격으로 `GET /analysis-jobs/{job_id}`를 폴링해 완료를 기다린다. 개별 AI 요청의 timeout은 20분(`AI_REQUEST_TIMEOUT_MS`)이다.
 
 최신 AI job에 없는 종목 후보, 신호 축, 수신자, 매크로 이벤트는 채워 넣지 않고 화면에 미제공 상태를 표시한다. 랜딩의 샘플 CTA는 mock 리포트 상세 route가 아니라 실제 분석 시작 화면으로 연결된다.
 `/analysis-jobs` 응답은 화면 contract상 노출 대상인 `status`, `trace_id`, `schema_version`, `strategy_spec`, `debug_ref`, `retryable`, `user_payload`만 유지한다. `internal_payload`는 화면 노출하지 않는다.

@@ -8,7 +8,7 @@ history routes currently represented by FE mocks.
 | FE route | Storage |
 | --- | --- |
 | `/reports` | `app.strategy_report_summary_v` |
-| `/reports/strategies/:strategyId` | `app.strategy_report_profile`, `app.strategy_email_report` |
+| `/reports/strategies/:strategyId` (retired in FE) | `app.strategy_report_profile`, `app.strategy_email_report` |
 | `/reports/:reportId` | `app.strategy_email_report`, `app.strategy_email_report_news`, `app.strategy_email_report_candidate` |
 | `/me` email history | `app.email_digest_history_v` |
 

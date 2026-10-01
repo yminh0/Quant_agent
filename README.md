@@ -9,7 +9,7 @@
 ![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
 ![Node 24](https://img.shields.io/badge/node-24-339933?logo=node.js&logoColor=white)
 
-[주요 기능](#주요-기능) · [동작 방식](#동작-방식) · [빠른 시작](#빠른-시작) · [저장소 구성](#저장소-구성) · [문서](#문서)
+[주요 기능](#주요-기능) · [동작 방식](#동작-방식) · [기술 스택](#기술-스택) · [빠른 시작](#빠른-시작) · [저장소 구성](#저장소-구성) · [문서](#문서)
 
 </div>
 
@@ -44,6 +44,21 @@ flowchart LR
 분석 파이프라인은 다음 순서로 실행됩니다.
 
 `Supervisor → Ambiguity → Data → Research → BacktestCode → Backtest → Signal → Risk Manager → Report`
+
+## 기술 스택
+
+| 영역 | 기술 |
+| --- | --- |
+| **Frontend** | React 19, TypeScript, Vite, Tailwind CSS 4 |
+| **AI 파이프라인** | Python 3.11, FastAPI, Pydantic v2, LangChain · LangGraph(초기 에이전트 그래프) → 자체 순차 파이프라인(`ExplicitAnalysisPipeline`) |
+| **LLM** | Azure OpenAI Responses API(web search tool 포함), 역할별 모델 분리(Research · Signal · Report의 Bull/Bear/Judge, 코드 생성) |
+| **백테스트** | NumPy, TA-Lib, QuantStats, walk-forward 검증 · 프로세스 풀 병렬 평가 |
+| **Backend** | FastAPI, SQLAlchemy(asyncio) · asyncpg, Redis 세션, Google OAuth, Brevo 이메일, PyMuPDF |
+| **데이터** | PostgreSQL · TimescaleDB(`meta/raw/core/feature/mart` + 서비스 `app` 스키마), Apache Airflow 2.9 |
+| **데이터 소스** | KRX, 한국투자증권(KIS) Open API, OpenDART, 한국은행 ECOS, FnGuide WICS |
+| **운영** | GitHub Actions(CI · 배포 · 릴리스 게이트 · 헬스체크), Rocky Linux 8.10, pytest · ruff · node test |
+
+에이전트 그래프는 처음에 LangChain과 LangGraph(`StateGraph`)로 구성했습니다. 이후 LangGraph 설치 여부에 따라 실행 경로가 갈리는 문제를 없애기 위해, 같은 노드 순서를 직접 실행하는 `ExplicitAnalysisPipeline`으로 정리했습니다. LLM 호출은 `httpx` 기반 Azure OpenAI 클라이언트가 담당하고, 로컬과 CI에서는 mock 클라이언트로 결정론적으로 실행합니다.
 
 ## 빠른 시작
 
@@ -91,7 +106,7 @@ cd fe && npm install && npm run dev
 | [`ai/`](ai) | 분석 API와 파이프라인 (`ai_graph`) |
 | [`backtest_module/`](backtest_module) | 백테스트 엔진 |
 | [`backend/`](backend) | Google OAuth·세션, 리포트 이메일, 시세 티커 |
-| [`DE/`](DE) · [`airflow/`](airflow) | OHLCV·지표·유니버스 적재와 데이터 마이그레이션 |
+| [`DE/`](DE) · [`DE/airflow/`](DE/airflow) | OHLCV·지표·유니버스 적재와 데이터 마이그레이션 |
 | [`service_db/`](service_db) | 서비스 DB 마이그레이션 (job·정책·감사) |
 | [`scripts/`](scripts) · [`.github/workflows/`](.github/workflows) | 배포 게이트, CI, 서버 헬스체크 |
 
